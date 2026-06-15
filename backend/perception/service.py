@@ -1,13 +1,18 @@
 """Extended Perception business logic.
 
 All the generic machinery driven by catalog.py:
-  - ingest(): sparse, permission-gated report; resolve raw->label; merge into
-    per-field state; trigger debounced wakes on significant change.
-  - snapshot(): current authorized+fresh fields; unauthorized/stale -> null.
-  - permissions / config views and updates.
+  - ingest(): sparse, permission-gated report. Sensitive signals arrive as v1
+    envelopes (encrypted on-device; plaintext rejected) and are stored
+    ciphertext; operational signals (time/battery/broadcast/focus/user_state)
+    stay cleartext for the wake gate and TTL logic. Wakes are triggered by the
+    client's value-free `changed` flag, debounced as before.
+  - snapshot(): current fresh state — cleartext operational fields resolved,
+    encrypted signals returned as envelopes (the enclave or the device
+    decrypts; the backend filters freshness off the cleartext ts only).
   - user_state with the Focus override/restore stack.
-  - photo two-step flow (evaluate+stage with sensitivity gate, then confirm).
-  - generic collection ingest/read for Tier 2 (calendar / health).
+  - photo one-step flow (sensitivity gate on cleartext coarse metadata;
+    pixels + sensitive context ciphertext).
+  - generic collection ingest/read for Tier 2 (calendar / health), envelope-only.
 
 No business logic lives in app.py. The only app.py coupling is a lazy import in
 _fire_wake() to enqueue a proactive job (the existing wake mechanism).
@@ -76,10 +81,13 @@ def _parse_data(data):
 
 
 def ingest_snapshot(user_id: str, items: list, client_ts=None) -> dict:
-    """Ingest a {context_snapshot:[{key,data,message}]} report. `data` is a JSON
-    string (or "null"). Composite keys (e.g. device) expand into their sub-signals;
-    aliases (e.g. location_signal -> location) are normalized."""
-    pairs: list[tuple] = []  # (input_name, value, message)
+    """Ingest a {context_snapshot:[...]} report. A plain item is {key, data,
+    message} (`data` is a JSON string or "null"); an ENCRYPTED item is
+    {key, envelope, changed} — the v1 envelope replaces `data`, and `changed`
+    is the client's value-free change flag that drives wake triggering (the
+    backend can't compare ciphertexts). Composite keys (e.g. device) expand
+    into their sub-signals; aliases (location -> location_signal) normalize."""
+    pairs: list[tuple] = []  # (input_name, value, message, envelope, changed)
     for it in (items or []):
         if not isinstance(it, dict):
             continue
@@ -87,24 +95,31 @@ def ingest_snapshot(user_id: str, items: list, client_ts=None) -> dict:
         if not key:
             continue
         msg = it.get("message")
+        # Pass the RAW envelope (don't collapse a malformed non-dict to None
+        # here) so _apply can reject a malformed encrypted payload instead of
+        # silently treating it as a null report that clears the signal.
+        envelope = it.get("envelope")
+        changed = _truthy(it.get("changed"))
+        data_present = "data" in it
         value = _parse_data(it.get("data"))
         if key in catalog.COMPOSITE_KEYS:
             subs = catalog.COMPOSITE_KEYS[key]
             if isinstance(value, dict):
                 for sub in subs:
                     if sub in value:
-                        pairs.append((sub, value[sub], msg))
+                        pairs.append((sub, value[sub], msg, None, False, True))
             elif value is None:
                 for sub in subs:
-                    pairs.append((sub, None, msg))
+                    pairs.append((sub, None, msg, None, False, data_present))
             continue
-        pairs.append((key, value, msg))
+        pairs.append((key, value, msg, envelope, changed, data_present))
     return _apply(user_id, pairs, client_ts)
 
 
 def ingest(user_id: str, signals: dict, client_ts: float | None = None) -> dict:
     """Back-compat / internal: ingest a flat {key: value} map (no messages)."""
-    return _apply(user_id, [(k, v, None) for k, v in (signals or {}).items()], client_ts)
+    return _apply(user_id, [(k, v, None, None, False) for k, v in (signals or {}).items()],
+                  client_ts)
 
 
 def _cell(value, ts: float, msg) -> dict:
@@ -112,6 +127,40 @@ def _cell(value, ts: float, msg) -> dict:
     if msg is not None:
         cell["msg"] = msg
     return cell
+
+
+_ENVELOPE_REQUIRED_FIELDS = ("body_ct", "nonce", "K_user", "visibility", "owner_user_id")
+
+
+def _envelope_error(env: dict, user_id: str) -> str:
+    """Validate a v1 envelope on a perception write path: required fields,
+    owner binding, and visibility. Returns "" when valid.
+
+    Perception envelopes MUST be `shared` (K sealed to the enclave too). Unlike
+    chat/memory, a local_only perception value is useless — the agent can never
+    read it (the enclave can't decrypt it) — AND it's a trap: the persistent
+    rows (Tier 2 items, photo metadata) can't be rewrapped on key rotation, so
+    one local_only upload would block rotation forever. So we reject local_only
+    here at the single write-validation seam rather than store an unrewrappable,
+    unreadable row."""
+    missing = [f for f in _ENVELOPE_REQUIRED_FIELDS if not env.get(f)]
+    if missing:
+        return "envelope_missing_fields:" + ",".join(missing)
+    # v MUST be the supported integer version. A non-integer v (e.g. "x" or a
+    # list) passes the field checks but later crashes the enclave at
+    # int(env.get("v")) with an UNCAUGHT ValueError -> 500 on the snapshot read,
+    # and a persistent collection item would stay unreadable indefinitely. Pin
+    # it to v1 here at the write seam (bools are ints in Python -> exclude them).
+    v = env.get("v", 1)
+    if isinstance(v, bool) or not isinstance(v, int) or v != 1:
+        return "envelope_unsupported_version"
+    if env.get("visibility") != "shared":
+        return "envelope_must_be_shared"
+    if str(env.get("owner_user_id")) != str(user_id):
+        return "envelope_owner_mismatch"
+    if not env.get("K_enclave"):
+        return "envelope_missing_fields:K_enclave"
+    return ""
 
 
 def _apply(user_id: str, pairs: list, client_ts=None) -> dict:
@@ -123,7 +172,11 @@ def _apply(user_id: str, pairs: list, client_ts=None) -> dict:
     input_fields: dict[str, list] = {}   # input_name -> output fields it proposed
     wake_pending: list[tuple] = []       # (cap_key, debounce, field, old, new)
 
-    for input_name, value, msg in pairs:
+    for input_name, value, msg, envelope, changed, *rest in pairs:
+        # 6th element (optional, back-compat): whether `data` was explicitly
+        # supplied in the item. None of the legacy 5-tuple callers carry it, so
+        # default True (data present) to preserve their behavior.
+        data_present = rest[0] if rest else True
         if input_name in catalog.IGNORED_KEYS:
             results[input_name] = "ignored"  # e.g. "unsupported" (all-null placeholder)
             continue
@@ -147,6 +200,47 @@ def _apply(user_id: str, pairs: list, client_ts=None) -> dict:
             results[input_name] = "accepted"
             continue
 
+        # Encrypted signals: the value travels as a v1 envelope; the backend
+        # stores it verbatim under the SIGNAL key ({"env",ts} cell — the ts
+        # guard and TTL work off the cleartext ts) and never sees the value.
+        # Wake triggering uses the client's value-free `changed` flag; the
+        # debounce window still caps the wake rate even if a client always
+        # claims changed. Plaintext `data` for these signals is rejected.
+        if sig.encrypted:
+            if envelope is not None:
+                if not isinstance(envelope, dict):
+                    # Malformed payload (string/list/…). Reject — do NOT fall
+                    # through to the null path, which would clear valid state.
+                    results[input_name] = "rejected:malformed_envelope"
+                    continue
+                err = _envelope_error(envelope, user_id)
+                if err:
+                    results[input_name] = f"rejected:{err}"
+                    continue
+                patch[key] = {"env": envelope, "ts": now}
+                input_fields[input_name] = [key]
+                cap = catalog.CAPABILITIES[sig.capability]
+                # Only wake on SHARED envelopes: the enclave can't decrypt
+                # local_only, so the agent would wake to null fields — a
+                # contextless (and potentially misleading) proactive ping.
+                if (cap.wake_source and sig.significant and changed
+                        and envelope.get("visibility") == "shared"):
+                    wake_pending.append((sig.capability, cap.debounce_sec, key))
+            elif data_present and value is None:
+                # explicit data:"null" -> unavailable now (no permission / no
+                # value); the message here is operational copy, not a sensitive
+                # value. Only an EXPLICIT null clears the cell.
+                patch[key] = _cell(None, now, msg)
+                input_fields[input_name] = [key]
+            elif not data_present:
+                # Neither an envelope nor a `data` field: a malformed item (e.g.
+                # {"key":"location_signal"}). Encrypted signals are envelope-
+                # mandatory — do NOT silently clear a valid encrypted cell.
+                results[input_name] = "rejected:envelope_required"
+            else:
+                results[input_name] = "rejected:plaintext_requires_envelope"
+            continue
+
         fields: list[str] = []
         if value is None:
             # data:"null" -> field unavailable now; record null + message. No wake.
@@ -154,7 +248,7 @@ def _apply(user_id: str, pairs: list, client_ts=None) -> dict:
                 patch[fname] = _cell(None, now, msg)
                 fields.append(fname)
         else:
-            # Resolve raw -> label (raw discarded) or store as-is.
+            # Resolve raw -> state fields, or store as-is.
             if sig.resolver:
                 fn = resolve.RESOLVERS.get(sig.resolver)
                 resolved = fn(value, config) if fn else {}
@@ -169,7 +263,7 @@ def _apply(user_id: str, pairs: list, client_ts=None) -> dict:
                 fields.append(fname)
                 old = (prev_state.get(fname) or {}).get("v")
                 if cap.wake_source and sig.significant and new_v != old:
-                    wake_pending.append((sig.capability, cap.debounce_sec, fname, old, new_v))
+                    wake_pending.append((sig.capability, cap.debounce_sec, fname))
         input_fields[input_name] = fields
 
     # Atomic ts-guarded write under a row lock: a field is persisted only if its
@@ -184,9 +278,9 @@ def _apply(user_id: str, pairs: list, client_ts=None) -> dict:
     # device "back after a long lock" wake (only if the field was actually written).
     _maybe_unlock_wake(user_id, patch, written, prev_state, now, wake_pending)
 
-    for (capk, debounce, f, old, new_v) in wake_pending:
+    for (capk, debounce, f) in wake_pending:
         if f in written:
-            _maybe_wake(user_id, capk, debounce, f, old, new_v, now)
+            _maybe_wake(user_id, capk, debounce, f, now)
 
     return results
 
@@ -225,7 +319,7 @@ def _maybe_unlock_wake(user_id, patch, written, prev_state, now, wake_candidates
     except (TypeError, ValueError):
         was_long = True
     if new <= 60 and was_long:
-        wake_candidates.append(("device", 0.0, "last_unlock_ago_sec", prev, new))
+        wake_candidates.append(("device", 0.0, "last_unlock_ago_sec"))
 
 
 # ---------------------------------------------------------------------------
@@ -270,41 +364,42 @@ def _last_wake_ts(user_id: str, cap_key: str) -> float:
     return 0.0
 
 
-def _maybe_wake(user_id, cap_key, debounce, field, old, new_v, now) -> None:
+def _maybe_wake(user_id, cap_key, debounce, field, now) -> None:
+    # Event docs and wake hints carry NO values (old/new) — perception values
+    # are encrypted at rest, and the audit trail / proactive job hint must not
+    # leak them. The agent reads actual values from the decrypted snapshot.
     block = _wake_block_reason(user_id)
     if block:
         store.append_event(user_id, {
             "cap": cap_key, "type": "suppressed", "reason": block,
-            "field": field, "old": old, "new": new_v, "ts": now,
+            "field": field, "ts": now,
         }, now)
         return
     if debounce and (now - _last_wake_ts(user_id, cap_key)) < debounce:
         store.append_event(user_id, {
-            "cap": cap_key, "type": "debounced", "field": field,
-            "old": old, "new": new_v, "ts": now,
+            "cap": cap_key, "type": "debounced", "field": field, "ts": now,
         }, now)
         return
     store.append_event(user_id, {
-        "cap": cap_key, "type": "wake", "field": field,
-        "old": old, "new": new_v, "ts": now,
+        "cap": cap_key, "type": "wake", "field": field, "ts": now,
     }, now)
-    _fire_wake(user_id, cap_key, _wake_hint(cap_key, field, old, new_v), now)
+    _fire_wake(user_id, cap_key, _wake_hint(cap_key, field), now)
 
 
-def _wake_hint(cap_key: str, field: str, old, new_v) -> str:
+def _wake_hint(cap_key: str, field: str) -> str:
     if cap_key == "location":
-        return f"她到了一个新地方：place_label = {new_v}（之前 {old or '未知'}）。"
+        return "她到了一个新地方（具体地点标签见 perception 快照）。"
     if cap_key == "wifi":
-        return f"她连上了 {new_v}（之前 {old or '未知'}）。"
+        return "她换了 Wi-Fi 环境（见 perception 快照）。"
     if cap_key == "app":
-        return f"她切到了 {new_v} 类应用（之前 {old or '未知'}）。"
+        return "她切换了应用（见 perception 快照）。"
     if cap_key == "motion":
-        return f"她的运动状态变成了 {new_v}（之前 {old or '未知'}）。"
+        return "她的运动状态变了（见 perception 快照）。"
     if cap_key == "device" and field == "last_unlock_ago_sec":
         return "她长时间锁屏后刚刚解锁——拿起手机回来了。"
     if cap_key == "region":
-        return f"她到了 {new_v}——一个明确的'今天联系一下'时刻。"
-    return f"{cap_key} 发生了变化：{field} = {new_v}。"
+        return "她到了一个新的国家或地区——一个明确的'今天联系一下'时刻。"
+    return f"{cap_key} 发生了变化：{field}。"
 
 
 def _fire_wake(user_id: str, cap_key: str, hint: str, now: float) -> None:
@@ -343,29 +438,49 @@ def _fire_wake(user_id: str, cap_key: str, hint: str, now: float) -> None:
 # ---------------------------------------------------------------------------
 
 def snapshot(user_id: str, now: float | None = None) -> dict:
+    """Ciphertext-shape snapshot — the backend filters freshness off the
+    CLEARTEXT ts only and never decrypts:
+      - fields    : cleartext operational fields, TTL-filtered (stale -> null).
+      - encrypted : fresh encrypted signal cells {signal: {envelope, ts}};
+        stale or null-reported signals simply don't appear (consumers null
+        their output fields).
+      - recent_apps : ciphertext app-open events [{envelope, ts}], newest last.
+    The enclave (agent path) or the device (K_user) flattens this into the
+    agent-facing flat snapshot."""
     now = now or _now()
     state = store.get_state(user_id)
-    snap: dict = {}
+    fields: dict = {}
+    encrypted: dict = {}
     for sig in catalog.SIGNALS.values():
         cap = catalog.CAPABILITIES.get(sig.capability)
         if not cap or not cap.context_field:
+            continue
+        if sig.encrypted:
+            cell = state.get(sig.input)
+            if (isinstance(cell, dict) and isinstance(cell.get("env"), dict)
+                    and (now - float(cell.get("ts") or 0)) <= sig.ttl_sec):
+                encrypted[sig.input] = {"envelope": cell["env"], "ts": cell.get("ts")}
             continue
         for f in sig.outputs:
             if f == "user_state":
                 continue  # owned by the focus/manual stack, set below
             cell = state.get(f)
             if not isinstance(cell, dict):
-                snap[f] = None
+                fields[f] = None
                 continue
             if (now - float(cell.get("ts") or 0)) > sig.ttl_sec:
-                snap[f] = None  # stale -> agent treats as "don't infer"
+                fields[f] = None  # stale -> agent treats as "don't infer"
             else:
-                snap[f] = cell.get("v")  # null cell -> None (= no permission now)
+                fields[f] = cell.get("v")  # null cell -> None (= no permission now)
     # user_state is always present (manual default if nothing set).
-    snap["user_state"] = effective_user_state(user_id)
+    fields["user_state"] = effective_user_state(user_id)
     # recent_apps folds the old /app_usage read; capped to keep snapshot small.
-    snap["recent_apps"] = store.read_app_opens(user_id, limit=catalog.RECENT_APPS_LIMIT)
-    return snap
+    recent_apps = [
+        {"envelope": ev["env"], "ts": ev.get("ts")}
+        for ev in store.read_app_opens(user_id, limit=catalog.RECENT_APPS_LIMIT)
+        if isinstance(ev, dict) and isinstance(ev.get("env"), dict)
+    ]
+    return {"fields": fields, "encrypted": encrypted, "recent_apps": recent_apps}
 
 
 # ---------------------------------------------------------------------------
@@ -386,14 +501,6 @@ def set_manual_user_state(user_id: str, value: str, ts: float | None = None) -> 
     concurrent report can't clobber a newer manual value). ts=None means now."""
     ts = _now() if ts is None else float(ts)
     return _effective_from_doc(store.set_manual_user_state_guarded(user_id, value, ts))
-
-
-# ---------------------------------------------------------------------------
-# Permissions & config
-# ---------------------------------------------------------------------------
-
-def set_config(user_id: str, patch: dict) -> dict:
-    return store.merge_config(user_id, patch or {})
 
 
 # ---------------------------------------------------------------------------
@@ -423,7 +530,7 @@ def _photo_usable(meta: dict) -> tuple[bool, bool, str]:
 
 def photo_evaluate(user_id: str, metadata: dict,
                    content_envelope: dict | None = None,
-                   exif_gps: dict | None = None) -> tuple[dict, int]:
+                   meta_envelope: dict | None = None) -> tuple[dict, int]:
     """Single-step photo ingest: evaluate metadata AND (if usable) store the
     encrypted image in one call.
 
@@ -433,17 +540,20 @@ def photo_evaluate(user_id: str, metadata: dict,
     - Usable photos: the ciphertext goes into the screen-frame envelope channel
       (reuses the enclave's existing frame-decrypt path); the backend never sees
       plaintext. frame_id == photo_id == content_envelope.id.
+    - `metadata` (scene_hint etc.) stays CLEARTEXT — coarse enums/bools that the
+      hard-block gate must read synchronously. Sensitive context (place_label,
+      resolved on-device from EXIF GPS — raw coordinates never leave the phone)
+      arrives in the optional `meta_envelope` and is stored/passed ciphertext.
     """
     now = _now()
     metadata = metadata or {}
-    config = store.get_config(user_id)
-    place_label = None
-    if exif_gps:
-        place_label = resolve.resolve_geofence(exif_gps, config).get("place_label")
+    if meta_envelope is not None:
+        err = _envelope_error(meta_envelope, user_id)
+        if err:
+            return {"error": err}, 400
     usable, sensitive, reason = _photo_usable(metadata)
     photo_id = str((content_envelope or {}).get("id") or random_item_id())
     meta_out = {k: metadata.get(k) for k in catalog.PHOTO_METADATA_FIELDS}
-    meta_out["place_label"] = place_label
 
     if not usable:
         # Hard-blocked: do NOT store anything; any uploaded ciphertext is dropped.
@@ -453,10 +563,21 @@ def photo_evaluate(user_id: str, metadata: dict,
     if not content_envelope:
         return {"error": "content_envelope_required"}, 400
 
+    # Validate the pixel envelope the SAME way as meta_env / Tier 2 items: it's
+    # a persistent row that lands in the key-rotation rewrap inventory, so a
+    # local_only / enclave-keyless / owner-mismatched envelope is a trap — it
+    # can't be rewrapped and would block public-key rotation forever. Reject it
+    # at this single write seam rather than store an unrewrappable row.
+    err = _envelope_error(content_envelope, user_id)
+    if err:
+        return {"error": err}, 400
+
     # Store ciphertext in the frame channel + metadata as a confirmed item.
     store.put_photo_envelope(user_id, photo_id, now, content_envelope)
     doc = {"photo_id": photo_id, "metadata": meta_out, "status": "confirmed",
            "usable": True, "sensitive": False, "frame_id": photo_id}
+    if meta_envelope is not None:
+        doc["meta_env"] = meta_envelope
     store.item_upsert(user_id, "photo", photo_id, now, doc, expires_at=None)
 
     # Burst de-dup backstop: only wake once per cluster window.
@@ -478,7 +599,12 @@ def photos_recent(user_id: str, limit: int = 20) -> tuple[dict, int]:
     now = _now()
     items = [i for i in store.item_list(user_id, "photo", limit=limit, now=now)
              if i.get("status") == "confirmed"]
-    out = [{"photo_id": i.get("photo_id"), "metadata": i.get("metadata")} for i in items]
+    out = []
+    for i in items:
+        row = {"photo_id": i.get("photo_id"), "metadata": i.get("metadata")}
+        if i.get("meta_env"):
+            row["meta_envelope"] = i["meta_env"]  # ciphertext passthrough
+        out.append(row)
     return {"photos": out}, 200
 
 
@@ -491,12 +617,15 @@ def photo_content(user_id: str, photo_id: str) -> tuple[dict, int]:
     doc = store.item_get(user_id, "photo", photo_id, now=now)
     if not doc or doc.get("status") != "confirmed":
         return {"error": "not_found"}, 404
-    return {
+    out = {
         "photo_id": photo_id,
         "frame_id": doc.get("frame_id") or photo_id,
         "metadata": doc.get("metadata"),
         "decrypt_path": f"/v1/screen/frames/{doc.get('frame_id') or photo_id}/decrypt",
-    }, 200
+    }
+    if doc.get("meta_env"):
+        out["meta_envelope"] = doc["meta_env"]
+    return out, 200
 
 
 # ---------------------------------------------------------------------------
@@ -504,50 +633,99 @@ def photo_content(user_id: str, photo_id: str) -> tuple[dict, int]:
 # ---------------------------------------------------------------------------
 
 def items_ingest(user_id: str, kind: str, items: list[dict]) -> tuple[dict, int]:
+    """Each item is {item_id?, ts?, expires_at?, envelope} — the v1 envelope
+    wraps the whole doc (v1 encryption is mandatory; a plaintext `doc` is
+    rejected). Cleartext index columns (item_id/ts/expires_at) stay for
+    listing and GC; the value is only readable by the enclave or the device."""
     cap = catalog.KIND_CAPABILITY.get(kind)
     if not cap:
         return {"error": "unknown_kind"}, 400
     if not isinstance(items, list) or not all(isinstance(it, dict) for it in items):
         return {"error": "invalid_items"}, 400
+    for it in items:
+        if it.get("doc"):
+            return {"error": "plaintext_doc_rejected_envelope_required"}, 400
+        env = it.get("envelope")
+        if not isinstance(env, dict):
+            return {"error": "envelope_required"}, 400
+        err = _envelope_error(env, user_id)
+        if err:
+            return {"error": err}, 400
     now = _now()
     wrote = 0
     for it in items:
-        iid = str(it.get("item_id") or random_item_id())
+        env = it["envelope"]
+        iid = str(it.get("item_id") or env.get("id") or random_item_id())
         ts = float(it.get("ts") or now)
-        store.item_upsert(user_id, kind, iid, ts, it.get("doc") or {}, it.get("expires_at"))
+        store.item_upsert(user_id, kind, iid, ts, {"env": env}, it.get("expires_at"))
         wrote += 1
     return {"written": wrote}, 200
 
 
 def items_recent(user_id: str, kind: str, limit: int = 20) -> tuple[dict, int]:
+    """Ciphertext list: [{item_id, ts, expires_at, envelope}]. The enclave's
+    /v1/perception/items/<kind> (agent path) or the device decrypts."""
     cap = catalog.KIND_CAPABILITY.get(kind)
     if not cap:
         return {"error": "unknown_kind"}, 400
     now = _now()
-    return {"items": store.item_list(user_id, kind, limit=limit, now=now)}, 200
+    items = []
+    for row in store.item_list_rows(user_id, kind, limit=limit, now=now):
+        doc = row.get("doc") or {}
+        if not isinstance(doc.get("env"), dict):
+            continue  # pre-encryption legacy row (wiped by migration 0004)
+        items.append({"item_id": row.get("item_id"), "ts": row.get("ts"),
+                      "expires_at": row.get("expires_at"), "envelope": doc["env"]})
+    return {"items": items}, 200
 
 
 # ---------------------------------------------------------------------------
 # App usage (iOS Shortcut GET endpoint) — "what app at what time"
 # ---------------------------------------------------------------------------
 
+def _seal_for_user(user_id: str, plaintext: bytes) -> tuple[dict | None, str]:
+    """Server-side shared-envelope build (lazy app-layer imports, same pattern
+    as _app_proactive_settings). Used by paths whose client can't encrypt — the
+    iOS Shortcut GET. Plaintext exists transiently in backend memory; only the
+    envelope is persisted."""
+    from core import store as core_store        # lazy; assembly loads core first
+    from core import envelope as core_envelope  # lazy
+    return core_envelope._build_shared_envelope_for_store(
+        core_store.get_store(user_id), plaintext)
+
+
 def app_open(user_id: str, app: str, category: str | None = None,
              client_ts=None) -> tuple[dict, int]:
     """Record one app-open event (fired by an iOS Shortcut when the user opens an
-    app). Updates current app in the snapshot AND appends to the usage time series
-    for later stats."""
+    app). The Shortcut can't do ChaCha20, so the backend seals {app, category}
+    server-side and persists ONLY ciphertext (snapshot cell + usage time series).
+    If encryption material is unavailable (no user public key / enclave info),
+    the event is dropped with a 503 — never stored plaintext."""
     app = (app or "").strip()
     if not app:
         return {"error": "app_required"}, 400
     now = _coerce_ts(client_ts)
     category = (category or "").strip() or None
-    # current app -> snapshot (ts-guarded)
-    store.merge_state_guarded(user_id, {
-        "app_name": _cell(app, now, None),
-        "app_category": _cell(category, now, None),
-    })
-    # append to the usage time series
-    store.append_app_open(user_id, {"app": app, "category": category, "ts": now}, now)
+    # Body carries BOTH shapes from one envelope:
+    #   - values.{app_name,app_category}: the enclave snapshot flattener reads
+    #     body["values"][<output field>] for the "app" signal (outputs are
+    #     app_name/app_category), so the current-app fields populate.
+    #   - top-level app/category/ts: the enclave recent_apps reader reads these.
+    body = {
+        "values": {"app_name": app, "app_category": category},
+        "app": app, "category": category, "ts": now,
+    }
+    try:
+        env, err = _seal_for_user(user_id, json.dumps(body).encode("utf-8"))
+    except Exception as e:
+        env, err = None, f"seal_failed:{type(e).__name__}"
+    if env is None:
+        log.warning("app_open(%s) encryption unavailable: %s", user_id, err)
+        return {"error": "encryption_unavailable", "detail": err}, 503
+    # current app -> snapshot (ts-guarded, one envelope cell under the signal key)
+    store.merge_state_guarded(user_id, {"app": {"env": env, "ts": now}})
+    # append to the usage time series (same envelope: same value, same owner)
+    store.append_app_open(user_id, {"env": env, "ts": now}, now)
     return {"status": "ok", "app": app, "category": category, "ts": now}, 200
 
 

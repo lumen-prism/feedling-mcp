@@ -156,6 +156,7 @@ def _model_api_context_messages(
         "do_not_say": identity.get("do_not_say", []),
         "stable_definitions": identity.get("stable_definitions", []),
     }
+    perception_snapshot, perception_err = _perception_wake_snapshot(store.user_id, api_key)
     context_payload = {
         "agent_profile": hosted_history_import._model_api_agent_profile_context(store, identity),
         "identity": identity_summary,
@@ -166,11 +167,14 @@ def _model_api_context_messages(
         "pending_state_updates": pending_state_updates,
         # Extended Perception: coarse, permission-gated current state (place
         # label, motion, battery, user_state, …). null fields = unauthorized or
-        # stale; agent must not infer from null. See backend/perception/.
-        "perception": _perception_wake_snapshot(store.user_id),
+        # stale; agent must not infer from null. Sensitive values are decrypted
+        # inside the enclave (same model as chat history); without the enclave
+        # they degrade to null. See backend/perception/.
+        "perception": perception_snapshot,
         "context_errors": {
             "history": hist_err,
             "identity": identity_err,
+            "perception": perception_err,
         },
     }
     prompt_context_payload = dict(context_payload)

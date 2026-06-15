@@ -11,10 +11,12 @@ machinery:
 Adding a Tier 2 capability = adding rows here + (if it has query tools) a thin
 MCP pass-through. No changes to service/routes logic.
 
-Privacy: capabilities whose `resolver` is set accept RAW values (lat/lon, ssid,
-bundle id) and resolve them to coarse labels via the user's perception_config.
-The raw value is used transiently and never written to perception_state, so the
-agent only ever sees labels.
+Privacy: signals marked `encrypted` arrive as v1 envelopes (the device resolves
+raw values — GPS fix -> place_label, SSID -> wifi_label — locally and encrypts
+the resulting labels; raw values never go over the wire). The backend stores the
+envelope verbatim; only the enclave (or the user's device) can decrypt. Plain
+operational signals (time/battery/broadcast/focus/user_state) stay cleartext —
+the backend's wake gating and TTL logic read them synchronously.
 """
 from __future__ import annotations
 
@@ -44,6 +46,10 @@ class Signal:
     resolver: str | None = None      # name in resolve.RESOLVERS, or None (store as-is)
     ttl_sec: float = 600.0           # snapshot freshness; older -> null
     significant: bool = True         # value change can trigger a wake (if wake_source)
+    encrypted: bool = False          # value arrives as a v1 envelope; stored under the
+                                     # SIGNAL key as {"env",ts}; `outputs` then name the
+                                     # fields inside the envelope body's `values` (the
+                                     # enclave flattens them into the agent snapshot)
 
 
 # ---------------------------------------------------------------------------
@@ -74,13 +80,16 @@ CAPABILITIES: dict[str, Capability] = {c.key: c for c in [
 
 # ---------------------------------------------------------------------------
 # Signals (report inputs) — keyed by the iOS context_snapshot `key`.
-# `data` (a JSON string) parses into the shapes in perception-report-fields.md;
-# the resolver picks out the label/state fields and DISCARDS raw/precise fields
-# (coordinates, BSSID, placemark address) so the agent only sees coarse state.
+# Plain signals: `data` (a JSON string) parses into the shapes in
+# perception-report-fields.md and the resolver maps it to state fields.
+# Encrypted signals: the item carries `envelope` (v1) instead of `data`; the
+# decrypted body is {"values": {<output>: <value>, ...}, "message": ...}. The
+# device resolves raw -> label locally (geofence/SSID matching), so precise
+# fields (coordinates, BSSID, placemark address) never go over the wire.
 # ---------------------------------------------------------------------------
 
 SIGNALS: dict[str, Signal] = {s.input: s for s in [
-    # always-on
+    # always-on (operational; cleartext)
     Signal("time", "time", ("local_time", "timezone", "locale"),
            resolver="time", ttl_sec=300.0, significant=False),
     Signal("battery", "device", ("battery_level", "charging"),
@@ -88,18 +97,20 @@ SIGNALS: dict[str, Signal] = {s.input: s for s in [
     Signal("broadcast", "broadcast", ("broadcast_state", "broadcast_active"),
            resolver="broadcast", ttl_sec=300.0, significant=False),
 
-    # permissioned
+    # permissioned (sensitive; v1 envelope mandatory)
     Signal("location_signal", "location", ("place_label", "wifi_label", "country"),
-           resolver="location_signal", ttl_sec=900.0),
-    Signal("motion_state", "motion", ("motion_state",), ttl_sec=300.0),
+           ttl_sec=900.0, encrypted=True),
+    Signal("motion_state", "motion", ("motion_state",), ttl_sec=300.0, encrypted=True),
     Signal("calendar_next_event", "calendar", ("calendar_next_event",),
-           ttl_sec=3600.0, significant=False),
+           ttl_sec=3600.0, significant=False, encrypted=True),
     Signal("playback", "now_playing", ("now_playing",),
-           ttl_sec=600.0, significant=False),
-    # `app` is reported via the GET /app_open shortcut endpoint (not /report); this
-    # entry exists so app_name/app_category appear in the snapshot with a TTL.
+           ttl_sec=600.0, significant=False, encrypted=True),
+    # `app` is reported via the GET /app_open shortcut endpoint (not /report); the
+    # Shortcut can't encrypt, so the BACKEND seals the value server-side (transient
+    # plaintext in memory, ciphertext at rest). This entry exists so app_name/
+    # app_category appear in the snapshot with a TTL.
     Signal("app", "app", ("app_name", "app_category"),
-           ttl_sec=300.0, significant=False),
+           ttl_sec=300.0, significant=False, encrypted=True),
 ]}
 
 

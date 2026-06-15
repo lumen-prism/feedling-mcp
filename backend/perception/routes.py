@@ -30,12 +30,17 @@ def _body() -> dict:
 @bp.route("/report", methods=["POST"])
 def report():
     """Single multiplexed ingest. Body may carry any of:
-      - context_snapshot : list of {key, data, message} signal items (data is a
-        JSON string or "null"); a `user_state` key sets the manual user_state.
-      - items            : {kind: [item, ...]} collections (sleep/workout/vitals).
-      - config           : a config patch (geofences / ssid_labels / focus_map / ...).
+      - context_snapshot : list of signal items. Plain (operational) signals are
+        {key, data, message} (data is a JSON string or "null"); SENSITIVE signals
+        are {key, envelope, changed} — v1 envelope mandatory, plaintext rejected
+        with 400. A `user_state` key sets the manual user_state.
+      - items            : {kind: [{item_id?, ts?, expires_at?, envelope}, ...]}
+        collections (sleep/workout/vitals); envelope mandatory.
     At least one must be present (else 400). `client_ts` (optional) timestamps the
     context_snapshot for the freshness/ordering guard. Photos use /photo/evaluate.
+
+    `config` is GONE (410): geofence/SSID resolution moved on-device, and the
+    config (home/work coordinates) is no longer stored server-side.
     """
     uid = _uid()
     payload = _body()
@@ -43,10 +48,22 @@ def report():
     provided = False
     status = 200
 
+    config = payload.get("config")
+    if isinstance(config, dict) and config:
+        return jsonify({
+            "error": "config_no_longer_stored_server_side",
+            "hint": "geofences/ssid_labels live on the device; resolve labels "
+                    "locally and report encrypted signals instead",
+        }), 410
+
     cs = payload.get("context_snapshot")
     if isinstance(cs, list) and cs:
         provided = True
-        results.update(service.ingest_snapshot(uid, cs, client_ts=payload.get("client_ts")))
+        snap_results = service.ingest_snapshot(uid, cs, client_ts=payload.get("client_ts"))
+        if any(isinstance(v, str) and v.startswith("rejected:")
+               for v in snap_results.values()):
+            status = 400  # plaintext-for-encrypted-signal / bad envelope (valid items still applied)
+        results.update(snap_results)
 
     items = payload.get("items")
     if isinstance(items, dict) and items:
@@ -59,13 +76,8 @@ def report():
                 status = 400  # surface rejected/malformed collection uploads, don't 200 them
         results["items"] = item_results
 
-    config = payload.get("config")
-    if isinstance(config, dict) and config:
-        provided = True
-        results["config"] = service.set_config(uid, config)
-
     if not provided:
-        return jsonify({"error": "non-empty context_snapshot / items / config required"}), 400
+        return jsonify({"error": "non-empty context_snapshot / items required"}), 400
     return jsonify({"results": results}), status
 
 
@@ -84,11 +96,14 @@ def snapshot():
 
 @bp.route("/photo/evaluate", methods=["POST"])
 def photo_evaluate():
-    """Single-step photo ingest: metadata + (if usable) the encrypted image."""
+    """Single-step photo ingest: cleartext gate metadata + the encrypted image
+    + an optional meta_envelope (encrypted sensitive context, e.g. place_label
+    resolved on-device)."""
     uid = _uid()
     p = _body()
     out, code = service.photo_evaluate(
-        uid, p.get("metadata") or {}, p.get("content_envelope"), p.get("exif_gps"))
+        uid, p.get("metadata") or {}, p.get("content_envelope"),
+        meta_envelope=p.get("meta_envelope"))
     return jsonify(out), code
 
 

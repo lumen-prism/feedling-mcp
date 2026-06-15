@@ -12,15 +12,15 @@ import logging
 from psycopg.types.json import Jsonb
 
 from db import (
-    get_pool, log_append, log_read,
+    get_pool, log_append, log_read, log_read_all, log_patch_item,
     frame_upsert, frame_get, frame_delete,
 )
 
 log = logging.getLogger("perception.store")
 
 # user_blobs kinds (singletons, one row per user)
-STATE = "perception_state"            # {field: {"v": .., "ts": ..}}
-CONFIG = "perception_config"          # geofences / ssid_labels / focus_map / ...
+STATE = "perception_state"            # plain cell {field:{"v",ts}} or encrypted {signal:{"env",ts}}
+CONFIG = "perception_config"          # legacy (focus_map only); geofences/ssid_labels live on-device now
 USER_STATE = "perception_user_state"  # {"manual": "default", "focus_override": None}
 
 EVENT_STREAM = "perception_events"
@@ -151,10 +151,6 @@ def get_config(user_id: str) -> dict:
     return _get_blob(user_id, CONFIG)
 
 
-def merge_config(user_id: str, patch: dict) -> dict:
-    return _merge_blob(user_id, CONFIG, patch)
-
-
 def get_user_state_doc(user_id: str) -> dict:
     return _get_blob(user_id, USER_STATE)
 
@@ -201,7 +197,11 @@ def set_manual_user_state_guarded(user_id: str, value: str, ts: float) -> dict:
 # ---------------------------------------------------------------------------
 
 def item_upsert(user_id: str, kind: str, item_id: str, ts: float,
-                doc: dict, expires_at: float | None = None) -> None:
+                doc: dict, expires_at: float | None = None) -> bool:
+    """Insert/update one item. Returns True on success, False on DB failure.
+    The key-rotation rewrap relies on the bool to abort before swapping the
+    user key when a rewrapped item can't be persisted (otherwise that item
+    would be stranded on the retired key)."""
     try:
         with get_pool().connection() as conn:
             conn.execute(
@@ -211,8 +211,10 @@ def item_upsert(user_id: str, kind: str, item_id: str, ts: float,
                 "SET ts = EXCLUDED.ts, expires_at = EXCLUDED.expires_at, doc = EXCLUDED.doc",
                 (user_id, kind, item_id, ts, expires_at, Jsonb(doc)),
             )
+        return True
     except Exception as e:
         log.error("item_upsert(%s,%s,%s) failed: %s", user_id, kind, item_id, e)
+        return False
 
 
 def item_get(user_id: str, kind: str, item_id: str, now: float | None = None) -> dict | None:
@@ -253,6 +255,41 @@ def item_list(user_id: str, kind: str, limit: int = 20,
         return [r[0] for r in rows]
     except Exception as e:
         log.error("item_list(%s,%s) failed: %s", user_id, kind, e)
+        return []
+
+
+def item_list_rows(user_id: str, kind: str, limit: int | None = 20,
+                   now: float | None = None, strict: bool = False) -> list[dict]:
+    """Like item_list but includes the cleartext index columns — needed by the
+    ciphertext read path, where the doc is just {"env": envelope} and consumers
+    (enclave / iOS) need item_id/ts to label decrypted items.
+
+    limit=None means NO limit: the key-rotation rewrap must see every live row
+    — a silent cap would leave older rows sealed to the retired key.
+
+    strict=True RE-RAISES on a DB error instead of returning []. The rewrap
+    inventory must use strict: a swallowed listing failure would look like
+    "no encrypted content" and let the user key rotate while real envelopes
+    stay sealed to the old key."""
+    try:
+        sql = ("SELECT item_id, ts, expires_at, doc FROM perception_items "
+               "WHERE user_id = %s AND kind = %s")
+        params: list = [user_id, kind]
+        if now is not None:
+            sql += " AND (expires_at IS NULL OR expires_at > %s)"
+            params.append(now)
+        sql += " ORDER BY ts DESC"
+        if limit is not None:
+            sql += " LIMIT %s"
+            params.append(max(1, min(limit, 200)))
+        with get_pool().connection() as conn:
+            rows = conn.execute(sql, tuple(params)).fetchall()
+        return [{"item_id": r[0], "ts": r[1], "expires_at": r[2], "doc": r[3]}
+                for r in rows]
+    except Exception as e:
+        log.error("item_list_rows(%s,%s) failed: %s", user_id, kind, e)
+        if strict:
+            raise
         return []
 
 
@@ -338,11 +375,104 @@ APP_USAGE_STREAM = "app_usage"
 
 
 def append_app_open(user_id: str, doc: dict, ts: float) -> None:
-    log_append(user_id, APP_USAGE_STREAM, doc, ts=ts)
+    # item_key = envelope id so the key-rotation rewrap can patch this row's
+    # envelope in place (these events never expire, unlike perception_state).
+    env = doc.get("env")
+    item_key = env.get("id") if isinstance(env, dict) else None
+    log_append(user_id, APP_USAGE_STREAM, doc, ts=ts, item_key=item_key)
 
 
 def read_app_opens(user_id: str, limit: int = 100, since_epoch: float = 0.0) -> list[dict]:
     return log_read(user_id, APP_USAGE_STREAM, limit=limit, since_epoch=since_epoch)
+
+
+def read_all_app_opens(user_id: str, strict: bool = False) -> list[dict]:
+    """EVERY app-open row (no limit) — for the key-rotation rewrap.
+
+    strict=True RE-RAISES on a DB error (the generic log_read swallows it and
+    returns []). The rewrap inventory must use strict: a swallowed failure
+    here would omit every app_usage envelope and let the key rotate while
+    those rows stay sealed to the old key."""
+    if not strict:
+        return log_read_all(user_id, APP_USAGE_STREAM)
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT doc FROM user_logs WHERE user_id = %s AND stream = %s ORDER BY seq ASC",
+            (user_id, APP_USAGE_STREAM),
+        ).fetchall()
+    return [r[0] for r in rows]
+
+
+def update_app_open_env(user_id: str, item_key: str, env: dict) -> bool:
+    """Swap one app-open row's envelope in place (key rotation). Returns False
+    when no row matches item_key (e.g. a pre-item_key legacy row)."""
+    return log_patch_item(user_id, APP_USAGE_STREAM, item_key, {"env": env}) is not None
+
+
+def apply_rewrap_batch(user_id: str,
+                       item_upserts: list[tuple],
+                       app_usage_patches: list[tuple],
+                       frame_upserts: list[tuple] | None = None) -> tuple[bool, list[str]]:
+    """ATOMICALLY apply a batch of perception rewrites in ONE transaction.
+
+    - item_upserts: (kind, item_id, ts, doc, expires_at) for perception_items.
+    - app_usage_patches: (item_key, env) — patches user_logs app_usage rows in
+      place (matched by item_key); a 0-row match is a miss.
+    - frame_upserts: (frame_id, ts, env) — photo PIXEL envelopes in
+      frame_envelopes. They live outside perception_items but must rotate in the
+      SAME transaction, or a photo's pixels stay sealed to the retired key while
+      its meta_env / items moved on (then /v1/screen/frames/<id>/decrypt fails).
+
+    All-or-nothing: any DB error or app_usage miss rolls the whole batch back so
+    a partial rewrap can never persist some rows on the NEW key while the
+    endpoint then refuses to rotate (which would strand them). Returns
+    (True, []) on commit, or (False, misses) with nothing written."""
+    if not item_upserts and not app_usage_patches and not frame_upserts:
+        return True, []
+    misses: list[str] = []
+    try:
+        with get_pool().connection() as conn:
+            with conn.transaction():
+                for kind, item_id, ts, doc, expires_at in item_upserts:
+                    conn.execute(
+                        "INSERT INTO perception_items (user_id, kind, item_id, ts, expires_at, doc) "
+                        "VALUES (%s, %s, %s, %s, %s, %s) "
+                        "ON CONFLICT (user_id, kind, item_id) DO UPDATE "
+                        "SET ts = EXCLUDED.ts, expires_at = EXCLUDED.expires_at, doc = EXCLUDED.doc",
+                        (user_id, kind, item_id, ts, expires_at, Jsonb(doc)),
+                    )
+                for frame_id, ts, env in (frame_upserts or []):
+                    conn.execute(
+                        "INSERT INTO frame_envelopes (user_id, frame_id, ts, doc) "
+                        "VALUES (%s, %s, %s, %s) "
+                        "ON CONFLICT (user_id, frame_id) DO UPDATE "
+                        "SET ts = EXCLUDED.ts, doc = EXCLUDED.doc",
+                        (user_id, frame_id, float(ts), Jsonb(env)),
+                    )
+                for item_key, env in app_usage_patches:
+                    if not item_key:
+                        misses.append("app_usage:(no id)")
+                        continue
+                    cur = conn.execute(
+                        "UPDATE user_logs SET doc = doc || %s "
+                        "WHERE user_id = %s AND stream = %s AND item_key = %s",
+                        (Jsonb({"env": env}), user_id, APP_USAGE_STREAM, item_key),
+                    )
+                    if (cur.rowcount or 0) == 0:
+                        misses.append(f"app_usage:{item_key}")
+                if misses:
+                    # Roll the whole transaction back — no partial new-key state.
+                    raise _RewrapBatchMiss()
+        return True, []
+    except _RewrapBatchMiss:
+        return False, misses
+    except Exception as e:
+        log.error("apply_rewrap_batch(%s) failed: %s", user_id, e)
+        return False, misses or [f"db_error:{type(e).__name__}"]
+
+
+class _RewrapBatchMiss(Exception):
+    """Internal sentinel to roll back apply_rewrap_batch on an app_usage miss."""
 
 
 # ---------------------------------------------------------------------------
@@ -361,6 +491,20 @@ def put_photo_envelope(user_id: str, frame_id: str, ts: float, env: dict) -> Non
 
 def get_photo_envelope(user_id: str, frame_id: str) -> dict | None:
     return frame_get(user_id, frame_id)
+
+
+def get_photo_envelope_strict(user_id: str, frame_id: str) -> dict | None:
+    """Strict frame-envelope read for the key-rotation inventory: RE-RAISES on a
+    DB error instead of swallowing it. frame_get returns None on error, which
+    would hide a photo's pixel envelope and let the user key rotate while the
+    ciphertext stays sealed to the retired key (then /v1/screen/frames/<id>/
+    decrypt can never be decrypted with the new key)."""
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT doc FROM frame_envelopes WHERE user_id = %s AND frame_id = %s",
+            (user_id, frame_id),
+        ).fetchone()
+    return row[0] if row is not None else None
 
 
 def delete_photo_envelope(user_id: str, frame_id: str) -> None:

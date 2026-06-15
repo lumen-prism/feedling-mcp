@@ -998,7 +998,10 @@ def _model_api_agent_profile_context(store: UserStore, identity: dict) -> dict:
             "explicit user corrections",
             "AI persona materials",
             "Feedling Identity",
-            "relevant memory cards",
+            # "durable memory cards" matches runtime_boundary's vocabulary; the
+            # old "relevant memory cards" phrasing was retired with the
+            # candidate-memory prompt rewrite (tests guard against it).
+            "durable memory cards",
             "recent chat",
         ],
     }

@@ -1104,6 +1104,150 @@ def v1_identity_get():
                         "decrypt_errors": [{"reason": reason}]})
 
 
+def _perception_auth_and_sk():
+    """Shared auth + key-derivation preamble for the perception decrypt routes.
+    Returns (api_key, authorized_user_id, content_sk, None) or
+    (None, None, None, (json_response, status)) on failure."""
+    if not _state["ready"]:
+        return None, None, None, (jsonify({"error": "not_ready", "detail": _state["error"]}), 503)
+    api_key = _extract_api_key()
+    if not api_key:
+        return None, None, None, (jsonify({"error": "missing api_key"}), 401)
+    try:
+        whoami = _whoami_cached(api_key)
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 401:
+            return None, None, None, (jsonify({"error": "unauthorized"}), 401)
+        return None, None, None, (jsonify({"error": f"backend_error: {e}"}), 502)
+    except httpx.HTTPError as e:
+        return None, None, None, (jsonify({"error": f"backend_unreachable: {e}"}), 502)
+    authorized_user_id = whoami.get("user_id", "")
+    if not authorized_user_id:
+        return None, None, None, (jsonify({"error": "cannot resolve user_id"}), 401)
+    try:
+        content_sk = _get_or_derive_content_sk()
+    except Exception as e:
+        return None, None, None, (jsonify({"error": f"key_derivation_unavailable: {e}"}), 503)
+    return api_key, authorized_user_id, content_sk, None
+
+
+@app.route("/v1/perception/snapshot", methods=["GET"])
+def v1_perception_snapshot():
+    """Decrypt-and-serve the FLAT perception snapshot for the agent.
+
+    Pulls the ciphertext shape from the backend ({fields, encrypted,
+    recent_apps} — perception values are encrypted at rest, the backend only
+    TTL-filters on the cleartext ts), opens each signal envelope inside the
+    TEE, and flattens the decrypted bodies' `values` into the flat shape
+    downstream prompt assembly has always consumed (place_label, motion_state,
+    now_playing, …). Encrypted signals that are stale/absent/undecryptable
+    stay null — the agent's existing "null = don't infer" contract.
+    """
+    from perception import catalog as perception_catalog  # light: dataclasses only
+
+    api_key, authorized_user_id, content_sk, fail = _perception_auth_and_sk()
+    if fail:
+        return fail
+    try:
+        resp = _flask_get("/v1/perception/snapshot", api_key)
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 401:
+            return jsonify({"error": "unauthorized"}), 401
+        return jsonify({"error": f"backend_error: {e}"}), 502
+    except httpx.HTTPError as e:
+        return jsonify({"error": f"backend_error: {e}"}), 502
+
+    flat = dict(resp.get("fields") or {})
+    decrypt_errors: list[dict] = []
+    for sig in perception_catalog.SIGNALS.values():
+        cap = perception_catalog.CAPABILITIES.get(sig.capability)
+        if sig.encrypted and cap and cap.context_field:
+            for f in sig.outputs:
+                flat.setdefault(f, None)
+
+    encrypted = resp.get("encrypted") or {}
+    for key, cell in (encrypted.items() if isinstance(encrypted, dict) else []):
+        sig = perception_catalog.SIGNALS.get(key)
+        env = cell.get("envelope") if isinstance(cell, dict) else None
+        if sig is None or not isinstance(env, dict):
+            continue
+        if env.get("visibility") == "local_only":
+            continue  # no K_enclave; outputs stay null for the agent
+        try:
+            body = json.loads(_decrypt_envelope(env, authorized_user_id, content_sk))
+            values = body.get("values") if isinstance(body, dict) else None
+            if isinstance(values, dict):
+                for f in sig.outputs:
+                    if f in values:
+                        flat[f] = values[f]
+        except (DecryptFailure, json.JSONDecodeError, UnicodeDecodeError) as e:
+            reason = e.reason if isinstance(e, DecryptFailure) else f"json: {e}"
+            decrypt_errors.append({"signal": key, "reason": reason})
+
+    recent_apps: list[dict] = []
+    for ev in (resp.get("recent_apps") or []):
+        env = ev.get("envelope") if isinstance(ev, dict) else None
+        if not isinstance(env, dict):
+            continue
+        try:
+            doc = json.loads(_decrypt_envelope(env, authorized_user_id, content_sk))
+            if isinstance(doc, dict):
+                recent_apps.append({"app": doc.get("app"), "category": doc.get("category"),
+                                    "ts": ev.get("ts") or doc.get("ts")})
+        except (DecryptFailure, json.JSONDecodeError, UnicodeDecodeError) as e:
+            reason = e.reason if isinstance(e, DecryptFailure) else f"json: {e}"
+            decrypt_errors.append({"signal": "recent_apps", "reason": reason})
+    flat["recent_apps"] = recent_apps
+
+    out = {"snapshot": flat, "user_id": authorized_user_id}
+    if decrypt_errors:
+        out["decrypt_errors"] = decrypt_errors
+    return jsonify(out)
+
+
+@app.route("/v1/perception/items/<kind>", methods=["GET"])
+def v1_perception_items(kind):
+    """Decrypt-and-serve a Tier 2 perception collection (workout/sleep/vitals)
+    for the agent's query tools. Same model as the snapshot route: the backend
+    serves ciphertext rows, the TEE opens each item envelope."""
+    api_key, authorized_user_id, content_sk, fail = _perception_auth_and_sk()
+    if fail:
+        return fail
+    try:
+        limit = max(1, min(int(request.args.get("limit", 20)), 20))
+    except ValueError:
+        limit = 20
+    try:
+        resp = _flask_get(f"/v1/perception/items/{kind}", api_key, {"limit": str(limit)})
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code in (400, 401, 404):
+            return jsonify({"error": e.response.text[:200]}), e.response.status_code
+        return jsonify({"error": f"backend_error: {e}"}), 502
+    except httpx.HTTPError as e:
+        return jsonify({"error": f"backend_error: {e}"}), 502
+
+    items_out: list[dict] = []
+    for it in (resp.get("items") or []):
+        if not isinstance(it, dict):
+            continue
+        base = {"item_id": it.get("item_id"), "ts": it.get("ts")}
+        env = it.get("envelope")
+        if not isinstance(env, dict):
+            continue
+        if env.get("visibility") == "local_only":
+            base["decrypt_status"] = "local_only_agent_cannot_read"
+            items_out.append(base)
+            continue
+        try:
+            base["doc"] = json.loads(_decrypt_envelope(env, authorized_user_id, content_sk))
+            base["decrypt_status"] = "ok"
+        except (DecryptFailure, json.JSONDecodeError, UnicodeDecodeError) as e:
+            reason = e.reason if isinstance(e, DecryptFailure) else f"json: {e}"
+            base["decrypt_status"] = f"error: {reason}"
+        items_out.append(base)
+    return jsonify({"kind": kind, "items": items_out, "user_id": authorized_user_id})
+
+
 @app.route("/v1/screen/frames/<frame_id>/decrypt", methods=["GET"])
 def v1_frame_decrypt(frame_id):
     """Decrypt a single v1 screen-frame envelope and return its plaintext.

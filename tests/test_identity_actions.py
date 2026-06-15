@@ -231,6 +231,8 @@ def test_model_api_chat_background_runtime_updates_relationship_days(client, mon
 
     monkeypatch.setattr(provider_client, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
     monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", lambda envelope, key, purpose: b"sk-test")
+    # provider key 落库前强制信封加密；测试环境没有 enclave attestation，走假信封。
+    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder([]))
 
     def fake_enclave_context(path, key, params=None):
         if path == "/v1/identity/get":

@@ -23,6 +23,8 @@ from core import envelope as core_envelope
 from core import store as core_store
 from identity import service as identity_service
 from memory import service as memory_service
+from perception import store as perception_store
+from perception.catalog import KIND_CAPABILITY as PERCEPTION_ITEM_KINDS
 
 bp = Blueprint("content", __name__)
 
@@ -35,6 +37,56 @@ def _has_encrypted_content_record(item: dict | None) -> bool:
     )
 
 
+class PerceptionInventoryError(Exception):
+    """A perception listing failed while building the rewrap inventory. The
+    callers turn this into a refusal to rotate the key — never an empty
+    inventory — so envelopes can't be stranded on the retired key by a
+    transient DB error."""
+
+
+def _perception_rewrap_rows(user_id: str) -> list[tuple[str, str, dict, dict]]:
+    """Live perception envelopes eligible for rewrap: Tier 2 collection items
+    (doc = {"env": envelope}), photo meta envelopes (doc["meta_env"]), photo
+    PIXEL envelopes (in frame_envelopes, keyed by frame_id == photo_id), and the
+    persistent app-usage events ({"env": envelope} log rows — they never
+    expire, so they MUST follow the key). All listings are UNCAPPED and STRICT:
+    a silent cap or a swallowed DB error would rotate the key with older rows
+    still sealed to the old one. Returns (kind, item_id, row, envelope) tuples.
+    Raises PerceptionInventoryError if any listing fails. Short-TTL
+    perception_state cells are intentionally NOT rewrapped — they expire and
+    repopulate from the device within minutes of a key change."""
+    now = time.time()
+    rows: list[tuple[str, str, dict, dict]] = []
+    try:
+        for kind in PERCEPTION_ITEM_KINDS:  # workout / sleep / vitals
+            for row in perception_store.item_list_rows(user_id, kind, limit=None, now=now, strict=True):
+                env = (row.get("doc") or {}).get("env")
+                if isinstance(env, dict):
+                    rows.append((kind, str(row.get("item_id") or ""), row, env))
+        for row in perception_store.item_list_rows(user_id, "photo", limit=None, now=now, strict=True):
+            doc = row.get("doc") or {}
+            item_id = str(row.get("item_id") or "")
+            env = doc.get("meta_env")
+            if isinstance(env, dict):
+                rows.append(("photo_meta", item_id, row, env))
+            # The photo's pixel ciphertext lives in frame_envelopes (keyed by
+            # frame_id == photo_id), NOT in the perception_items doc. It must
+            # follow the key too, or /v1/screen/frames/<id>/decrypt stays sealed
+            # to the retired K_user and the device can't decrypt the photo.
+            frame_id = str(doc.get("frame_id") or item_id)
+            pixel_env = perception_store.get_photo_envelope_strict(user_id, frame_id)
+            if isinstance(pixel_env, dict):
+                rows.append(("photo_pixels", frame_id, row, pixel_env))
+        for row in perception_store.read_all_app_opens(user_id, strict=True):
+            env = row.get("env") if isinstance(row, dict) else None
+            if isinstance(env, dict):
+                # app_usage rows are patched by item_key == envelope id on apply.
+                rows.append(("app_usage", str(env.get("id") or ""), row, env))
+    except Exception as e:
+        raise PerceptionInventoryError(str(e)) from e
+    return rows
+
+
 def _encrypted_content_counts(store: UserStore) -> dict:
     identity = identity_service._load_identity(store)
     moments = memory_service._load_moments(store)
@@ -44,8 +96,11 @@ def _encrypted_content_counts(store: UserStore) -> dict:
         "identity": 1 if _has_encrypted_content_record(identity) else 0,
         "memory": sum(1 for m in moments if _has_encrypted_content_record(m)),
         "chat": sum(1 for m in chat_msgs if _has_encrypted_content_record(m)),
+        "perception": sum(1 for (_, _, _, env) in _perception_rewrap_rows(store.user_id)
+                          if _has_encrypted_content_record(env)),
     }
-    counts["total"] = counts["identity"] + counts["memory"] + counts["chat"]
+    counts["total"] = (counts["identity"] + counts["memory"] + counts["chat"]
+                       + counts["perception"])
     return counts
 
 
@@ -75,7 +130,16 @@ def users_set_public_key():
             "user_id": store.user_id,
             "public_key_fpr": core_envelope._content_public_key_fingerprint(public_key),
         })
-    counts = _encrypted_content_counts(store)
+    try:
+        counts = _encrypted_content_counts(store)
+    except PerceptionInventoryError as e:
+        # Can't enumerate encrypted content right now — refuse to rotate rather
+        # than rotate on an undercount that strands perception envelopes.
+        return jsonify({
+            "error": "encrypted_content_inventory_unavailable",
+            "message": "Could not enumerate encrypted content; refusing to change public_key.",
+            "detail": str(e)[:200],
+        }), 503
     if existing and counts["total"] > 0:
         return jsonify({
             "error": "public_key_rotation_requires_rewrap",
@@ -173,6 +237,7 @@ def _rewrap_summary() -> dict:
         "identity": _rewrap_bucket(),
         "memory": _rewrap_bucket(),
         "chat": _rewrap_bucket(),
+        "perception": _rewrap_bucket(),
         "total_checked": 0,
         "total_rewrapped": 0,
         "total_skipped": 0,
@@ -398,6 +463,43 @@ def content_rewrap_to_current_key():
         if env is not None:
             chat_plans.append((item_id, env))
 
+    # perception Tier 2 items (workout/sleep/vitals docs) + photo meta envelopes.
+    # Short-TTL perception_state cells are skipped by design (see _perception_rewrap_rows).
+    # Collected BEFORE the apply phase: an inventory failure here aborts with 503
+    # and nothing has been persisted / no key rotated yet.
+    perception_plans: list[tuple[str, str, dict, dict]] = []
+    try:
+        perception_inventory = _perception_rewrap_rows(store.user_id)
+    except PerceptionInventoryError as e:
+        return jsonify({
+            "status": "failed",
+            "error": "perception_inventory_unavailable",
+            "message": "Could not enumerate perception envelopes; refusing to rotate the key.",
+            "detail": str(e)[:200],
+        }), 503
+    for kind, item_id, row, env_record in perception_inventory:
+        env, status, reason = _build_rewrapped_envelope(
+            store,
+            env_record,
+            api_key=api_key,
+            user_pk=user_pk,
+            enclave_pk=enclave_pk,
+            kind="perception",
+        )
+        # Perception envelopes are always shared by design. A local_only or
+        # enclave-keyless one CANNOT be rewrapped (the enclave can't decrypt it
+        # to re-seal), so rotating would strand it on the retired user key —
+        # promote those skips to ERRORS so the total_errors gate 409s instead
+        # of silently rotating. (skipped_unencrypted = malformed/empty, nothing
+        # to strand — left as a benign skip.)
+        if status in ("skipped_local_only", "skipped_missing_enclave_key"):
+            status = "error"
+            reason = reason or f"perception_envelope_not_rewrappable:{kind}"
+        results.append(_rewrap_record_result(
+            summary, "perception", f"{kind}:{item_id}", status, reason=reason))
+        if env is not None:
+            perception_plans.append((kind, item_id, row, env))
+
     response = {
         "status": "dry_run" if dry_run else "ok",
         "dry_run": dry_run,
@@ -420,6 +522,21 @@ def content_rewrap_to_current_key():
         return jsonify(response)
 
     now = datetime.now().isoformat()
+
+    # Ordering and the failure model. There is no single transaction spanning
+    # user_blobs (identity/memory), per-row chat, perception_items + user_logs,
+    # and the (partly in-memory) accounts registry, so the rotation can't be one
+    # atomic unit. Instead the registry public-key swap — the SOURCE OF TRUTH —
+    # is the LAST write and the commit point: every content envelope is rewrapped
+    # to the SAME requested key, and the key is swapped only after all content
+    # writes succeed. Any failure before the swap leaves the registry on the old
+    # key, so the device simply re-runs rewrap-to-current-key (idempotent: the
+    # enclave re-decrypts via K_enclave and re-seals to the same new key) and the
+    # transient mixed-key state converges. To keep the perception commit from
+    # being followed by other content SAVES that could raise (which would strand
+    # the just-committed perception rows), perception is applied LAST among the
+    # content writes — immediately before the key swap, so nothing but the swap
+    # itself follows it.
     if identity is not None and identity_plan is not None:
         new_identity = dict(identity)
         _apply_envelope_fields(new_identity, identity_plan)
@@ -450,6 +567,71 @@ def content_rewrap_to_current_key():
                 if isinstance(msg, dict) and msg.get("id") in swapped_ids:
                     msg["rewrapped_at"] = now
                     db.chat_append(store.user_id, msg["id"], msg["ts"], msg, core_store.MAX_CHAT_MESSAGES)
+
+    # Perception rewraps applied ATOMICALLY (single transaction across
+    # perception_items + app_usage), LAST among the content writes so the only
+    # step after its commit is the registry key swap below.
+    item_upserts: list[tuple] = []        # (row_kind, item_id, ts, doc, expires_at)
+    app_usage_patches: list[tuple] = []   # (item_key, env)
+    frame_upserts: list[tuple] = []       # (frame_id, ts, env)
+    for kind, item_id, row, env in perception_plans:
+        if kind == "app_usage":
+            app_usage_patches.append((item_id, env))
+            continue
+        if kind == "photo_pixels":
+            # The whole frame_envelopes doc IS the envelope (item_id == frame_id).
+            frame_upserts.append((item_id, float(row.get("ts") or time.time()), env))
+            continue
+        doc = dict(row.get("doc") or {})
+        if kind == "photo_meta":
+            doc["meta_env"] = env
+            row_kind = "photo"
+        else:
+            doc["env"] = env
+            row_kind = kind
+        item_upserts.append(
+            (row_kind, item_id, float(row.get("ts") or time.time()), doc, row.get("expires_at")))
+    ok, perception_misses = perception_store.apply_rewrap_batch(
+        store.user_id, item_upserts, app_usage_patches, frame_upserts)
+    if not ok:
+        response["status"] = "failed"
+        response["error"] = "perception_rewrap_incomplete"
+        response["perception_misses"] = perception_misses[:20]
+        print(f"[content-rewrap:{store.user_id}] perception rewrap rolled back: {len(perception_misses)} misses")
+        return jsonify(response), 409
+
+    # Concurrency guard (TOCTOU). A perception write (snapshot / app_open / photo)
+    # sealed to the OLD key could have landed AFTER _perception_rewrap_rows built
+    # the inventory but before this swap — it wouldn't be in perception_plans and
+    # would stay sealed to the retired key while rotation succeeds. These rows
+    # don't expire, so that would be permanent data loss. Re-enumerate and REFUSE
+    # to swap if any stored encrypted perception envelope is NOT one we just wrote
+    # (its K_user isn't among the freshly-sealed ones). The device retries rewrap
+    # (idempotent: the enclave re-decrypts via K_enclave and re-seals every row,
+    # straggler included) and converges. This shrinks the race window from many
+    # enclave round-trips down to a few DB reads — a large reduction, not a hard
+    # lock; a write in the microseconds before the swap can still slip, which the
+    # retry path then heals.
+    written_k_users = {env.get("K_user") for (_, _, _, env) in perception_plans}
+    try:
+        post_inventory = _perception_rewrap_rows(store.user_id)
+    except PerceptionInventoryError as e:
+        response["status"] = "failed"
+        response["error"] = "perception_inventory_unavailable"
+        response["detail"] = str(e)[:200]
+        print(f"[content-rewrap:{store.user_id}] post-rewrap re-enumeration failed; not rotating")
+        return jsonify(response), 503
+    stragglers = [
+        f"{kind}:{item_id}"
+        for kind, item_id, _, env in post_inventory
+        if _has_encrypted_content_record(env) and env.get("K_user") not in written_k_users
+    ]
+    if stragglers:
+        response["status"] = "failed"
+        response["error"] = "perception_rewrap_raced"
+        response["perception_stragglers"] = stragglers[:20]
+        print(f"[content-rewrap:{store.user_id}] concurrent write raced rotation: {len(stragglers)} stragglers; not rotating")
+        return jsonify(response), 409
 
     if not registry._set_user_public_key(store.user_id, requested_public_key):
         return jsonify({"error": "user not found"}), 404
