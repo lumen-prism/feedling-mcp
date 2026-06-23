@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Any
 
+from memory.action_schema import canonical_memory_executor_action
+
 
 ACTION_RESPONSE_FORMAT: dict[str, Any] = {"type": "json_object"}
 
@@ -345,125 +347,47 @@ def coerce_runtime_action(
         }
         return runtime_action
 
-    if action_type in {"memory.create", "memory.add", "memory.add_correction"}:
-        raw = payload.get("memory") if isinstance(payload.get("memory"), dict) else payload
-        summary = str(raw.get("summary") or raw.get("description") or raw.get("content") or raw.get("title") or "").strip()[:2000]
-        title = clean_text(raw.get("title") or summary, 180)
-        description = str(raw.get("description") or raw.get("content") or summary).strip()[:2000]
-        if not title or not description:
-            return None
-        mem_type = str(raw.get("type") or raw.get("card_type") or "fact").strip().lower()
-        if mem_type not in {"fact", "event", "quote", "moment"}:
-            mem_type = "fact"
-        source = "model_api_correction" if action_type == "memory.add_correction" else "hosted_runtime_state"
-        runtime_action["domain"] = "memory"
-        runtime_action["executor_action"] = {
-            "type": "memory.add_correction" if action_type == "memory.add_correction" else "memory.add",
-            "memory": {
-                "type": mem_type,
-                "title": title,
-                "description": description,
-                "summary": summary,
-                "occurred_at": clean_text(raw.get("occurred_at") or date.today().isoformat(), 80),
-                "source": clean_text(raw.get("source") or source, 80),
-                "context": str(raw.get("context") or "").strip()[:1000],
-                "her_quote": str(raw.get("her_quote") or "").strip()[:1000],
-                "verbatim": str(raw.get("verbatim") or raw.get("her_quote") or "").strip()[:1000],
-            },
-            "reason": reason,
-            "capture_mode": "state",
-        }
-        return runtime_action
-
-    if action_type in {"memory.supersede", "memory.replace", "memory.correct"}:
+    if action_type.startswith("memory."):
         memory_id = str(target.get("memory_id") or target.get("id") or payload.get("memory_id") or payload.get("id") or "").strip()
-        ids = _candidate_ids(target)
+        ids = _candidate_ids(target) if action_type in {
+            "memory.supersede",
+            "memory.replace",
+            "memory.correct",
+            "memory.patch",
+            "memory.content_patch",
+            "memory.delete",
+        } else []
+        action_for_schema = action
         if not memory_id and ids:
             memory_id = ids[0]
             runtime_action["requires_confirmation"] = True
             runtime_action["candidate_ids"] = ids
-        if not memory_id:
-            return None
-        raw = payload.get("memory") if isinstance(payload.get("memory"), dict) else payload
-        summary = str(raw.get("summary") or raw.get("description") or raw.get("content") or raw.get("title") or "").strip()[:2000]
-        if not summary:
-            return None
-        mem_type = str(raw.get("type") or raw.get("card_type") or "fact").strip().lower()
-        if mem_type not in {"fact", "event", "quote", "moment"}:
-            mem_type = "fact"
-        memory_payload = {
-            "type": mem_type,
-            "summary": summary,
-            "verbatim": str(raw.get("verbatim") or raw.get("her_quote") or "").strip()[:1000],
-            "occurred_at": clean_text(raw.get("occurred_at") or date.today().isoformat(), 80),
-            "source": clean_text(raw.get("source") or "hosted_runtime_state", 80),
-        }
-        context = str(raw.get("context") or "").strip()[:1000]
-        if context:
-            memory_payload["context"] = context
-        runtime_action["domain"] = "memory"
-        runtime_action["target"] = {"memory_id": memory_id}
-        runtime_action["executor_action"] = {
-            "type": "memory.supersede",
-            "supersedes": memory_id,
-            "memory": memory_payload,
-            "reason": reason,
-            "capture_mode": "state",
-        }
-        return runtime_action
-
-    if action_type in {"memory.patch", "memory.content_patch", "memory.delete"}:
-        memory_id = str(target.get("memory_id") or target.get("id") or payload.get("memory_id") or payload.get("id") or "").strip()
-        ids = _candidate_ids(target)
-        if not memory_id and ids:
-            memory_id = ids[0]
-            runtime_action["requires_confirmation"] = True
-            runtime_action["candidate_ids"] = ids
-        if not memory_id:
-            return None
-        preview = next((item for item in memory_candidates if str(item.get("id") or "") == memory_id), {})
-        if isinstance(preview, dict) and preview:
-            runtime_action["target_preview"] = {
-                "id": str(preview.get("id") or ""),
-                "title": clean_text(preview.get("title"), 180),
-                "description": clean_text(preview.get("description"), 600),
-                "type": clean_text(preview.get("type"), 80),
-                "occurred_at": clean_text(preview.get("occurred_at"), 80),
+            action_for_schema = {
+                **action,
+                "target": {**target, "memory_id": memory_id},
             }
-        runtime_action["target"] = {"memory_id": memory_id}
-        runtime_action["domain"] = "memory"
-        if action_type == "memory.delete":
-            runtime_action["executor_action"] = {
-                "type": "memory.delete",
-                "memory_id": memory_id,
-                "reason": reason,
-            }
-            return runtime_action
-
-        raw_patch = payload.get("patch") if isinstance(payload.get("patch"), dict) else payload
-        patch: dict[str, str] = {}
-        for key, max_len in (
-            ("title", 180),
-            ("description", 2000),
-            ("her_quote", 1000),
-            ("context", 1000),
-            ("type", 80),
-            ("occurred_at", 80),
-        ):
-            if key in raw_patch:
-                patch[key] = str(raw_patch.get(key) or "").strip()[:max_len]
-        if not patch:
-            description = str(payload.get("description") or payload.get("content") or payload.get("summary") or "").strip()[:2000]
-            if description:
-                patch["description"] = description
-        if not patch:
+        executor_action = canonical_memory_executor_action(action_for_schema)
+        if executor_action is None:
             return None
-        runtime_action["executor_action"] = {
-            "type": "memory.content_patch",
-            "memory_id": memory_id,
-            "patch": patch,
-            "reason": reason,
-        }
+        memory_id = str(
+            executor_action.get("memory_id")
+            or executor_action.get("supersedes")
+            or memory_id
+            or ""
+        )
+        if memory_id:
+            preview = next((item for item in memory_candidates if str(item.get("id") or "") == memory_id), {})
+            if isinstance(preview, dict) and preview:
+                runtime_action["target_preview"] = {
+                    "id": str(preview.get("id") or ""),
+                    "title": clean_text(preview.get("title"), 180),
+                    "description": clean_text(preview.get("description"), 600),
+                    "type": clean_text(preview.get("type"), 80),
+                    "occurred_at": clean_text(preview.get("occurred_at"), 80),
+                }
+            runtime_action["target"] = {"memory_id": memory_id}
+        runtime_action["domain"] = "memory"
+        runtime_action["executor_action"] = executor_action
         return runtime_action
 
     return None

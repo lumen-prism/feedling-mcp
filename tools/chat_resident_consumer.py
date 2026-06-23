@@ -77,6 +77,7 @@ Optional:
 
 import base64
 from dataclasses import dataclass, field
+from datetime import date
 import hashlib
 import inspect
 import json
@@ -247,6 +248,10 @@ IMAGE_TEMP_DIR = Path(os.environ.get("IMAGE_TEMP_DIR", "/tmp/feedling_chat_image
 SCREEN_CONTEXT_MODE = os.environ.get("SCREEN_CONTEXT_MODE", "on_mention").strip().lower()
 SCREEN_CONTEXT_MAX_AGE_SEC = int(os.environ.get("SCREEN_CONTEXT_MAX_AGE_SEC", "300"))
 SCREEN_CONTEXT_INCLUDE_IMAGE = _env_bool("SCREEN_CONTEXT_INCLUDE_IMAGE", True)
+ROUTE_A_MEMORY_RECALL_ENABLED = _env_bool("FEEDLING_ROUTE_A_MEMORY_RECALL", False)
+ROUTE_A_MEMORY_RECALL_LIMIT = int(os.environ.get("FEEDLING_ROUTE_A_MEMORY_RECALL_LIMIT", "50"))
+ROUTE_A_MEMORY_RECALL_TOP_K = int(os.environ.get("FEEDLING_ROUTE_A_MEMORY_RECALL_TOP_K", "5"))
+ROUTE_A_MEMORY_RECALL_MAX_CHARS = int(os.environ.get("FEEDLING_ROUTE_A_MEMORY_RECALL_MAX_CHARS", "1200"))
 FALLBACK_REPLY = os.environ.get(
     "FALLBACK_REPLY", "我这会儿有点慢，刚刚没接上。你稍后再发一次，我会继续接。"
 )
@@ -701,6 +706,88 @@ def _screen_context_for_message(content: str) -> tuple[str, list[dict[str, str]]
         parts.append("screenshot_file: " + ", ".join(paths))
 
     return "\n".join(parts), payloads, paths
+
+
+def _memory_recall_for_message(content: str) -> tuple[str, list[str]]:
+    """Fetch IO long-term memory cards for route A prompt injection.
+
+    The consumer only assembles the prompt block. Backend/enclave still own
+    index, fetch, decryption, and memory authorization.
+    """
+    if not ROUTE_A_MEMORY_RECALL_ENABLED:
+        return "", []
+    query = str(content or "").strip()
+    if not query:
+        return "", []
+
+    try:
+        index_resp = httpx.post(
+            f"{FEEDLING_API_URL}/v1/memory/index",
+            headers=_HEADERS,
+            json={
+                "query": query,
+                "limit": max(1, ROUTE_A_MEMORY_RECALL_LIMIT),
+                "include_sensitive": False,
+            },
+            timeout=20,
+        )
+        index_resp.raise_for_status()
+        index_body = index_resp.json() if isinstance(index_resp.json(), dict) else {}
+        items = index_body.get("items") if isinstance(index_body.get("items"), list) else []
+        ranked = sorted(
+            [item for item in items if isinstance(item, dict) and str(item.get("id") or "").strip()],
+            key=lambda item: float(item.get("score") or 0.0),
+            reverse=True,
+        )
+        ids: list[str] = []
+        for item in ranked:
+            mid = str(item.get("id") or "").strip()
+            if mid and mid not in ids:
+                ids.append(mid)
+            if len(ids) >= max(1, ROUTE_A_MEMORY_RECALL_TOP_K):
+                break
+        if not ids:
+            return "", []
+
+        fetch_resp = httpx.post(
+            f"{FEEDLING_API_URL}/v1/memory/fetch",
+            headers=_HEADERS,
+            json={"ids": ids},
+            timeout=20,
+        )
+        fetch_resp.raise_for_status()
+        fetch_body = fetch_resp.json() if isinstance(fetch_resp.json(), dict) else {}
+        fetched = fetch_body.get("items") if isinstance(fetch_body.get("items"), list) else []
+    except Exception as e:
+        log.warning("route A memory recall failed: %s", e)
+        return "", []
+
+    by_id = {
+        str(item.get("id") or ""): item
+        for item in fetched
+        if isinstance(item, dict) and str(item.get("id") or "")
+    }
+    lines = ["[IO 长期记忆 · 供参考，用户当前说法优先]"]
+    used_ids: list[str] = []
+    used_chars = 0
+    max_chars = max(200, ROUTE_A_MEMORY_RECALL_MAX_CHARS)
+    for mid in ids:
+        item = by_id.get(mid)
+        if not item:
+            continue
+        summary = str(item.get("summary") or item.get("description") or "").strip()
+        if not summary:
+            continue
+        line = f"- {summary}"
+        if used_chars + len(line) > max_chars:
+            break
+        lines.append(line)
+        used_ids.append(mid)
+        used_chars += len(line)
+
+    if len(lines) == 1:
+        return "", []
+    return "\n".join(lines), used_ids
 
 
 def _screen_context_for_frame_ids(frame_ids: list[str]) -> tuple[str, list[dict[str, str]], list[str]]:
@@ -2312,7 +2399,7 @@ def execute_agent_actions(actions: list[dict]) -> dict:
         if action_type.startswith("identity."):
             identity_actions.append(action)
         elif action_type.startswith("memory."):
-            memory_actions.append(action)
+            memory_actions.append(_normalize_v2_action_type(action))
         else:
             unsupported.append(action_type)
     if unsupported:
@@ -2572,7 +2659,165 @@ def _normalize_v2_action_type(action: dict) -> dict:
         out["type"] = typ.removeprefix("proactive.")
     elif typ and not out.get("type"):
         out["type"] = typ
+    if str(out.get("type") or "").startswith("memory."):
+        normalized = _normalize_memory_action_for_execute(out)
+        if normalized is not None:
+            return normalized
     return out
+
+
+def _resident_action_text(value: Any, limit: int) -> str:
+    return str(value or "").strip()[:limit]
+
+
+def _resident_action_payload(action: dict) -> dict:
+    value = action.get("payload")
+    return value if isinstance(value, dict) else {}
+
+
+def _resident_action_target(action: dict) -> dict:
+    value = action.get("target")
+    return value if isinstance(value, dict) else {}
+
+
+def _resident_memory_raw(payload: dict) -> dict:
+    value = payload.get("memory")
+    return value if isinstance(value, dict) else payload
+
+
+def _resident_memory_type(raw: dict) -> str:
+    mem_type = str(raw.get("type") or raw.get("card_type") or "fact").strip().lower()
+    return mem_type if mem_type in {"fact", "event", "quote", "moment"} else "fact"
+
+
+def _resident_memory_reason(action: dict, default: str) -> str:
+    return _resident_action_text(action.get("reason") or default, 500)
+
+
+def _resident_memory_id(action: dict, payload: dict, target: dict) -> str:
+    return _resident_action_text(
+        target.get("memory_id")
+        or target.get("id")
+        or payload.get("memory_id")
+        or payload.get("id"),
+        160,
+    )
+
+
+def _normalize_memory_action_for_execute(action: dict) -> dict | None:
+    """Normalize route A memory actions into backend executor action shape.
+
+    Keep this local to the resident consumer; conformance tests keep it aligned
+    with backend.memory.action_schema without requiring this script to import
+    backend runtime coerce code at deployment time.
+    """
+    action_type = str(action.get("type") or action.get("action") or "").strip().lower()
+    payload = _resident_action_payload(action)
+    target = _resident_action_target(action)
+
+    if action_type in {"memory.create", "memory.add", "memory.add_correction"}:
+        raw = _resident_memory_raw(payload)
+        summary = _resident_action_text(
+            raw.get("summary") or raw.get("description") or raw.get("content") or raw.get("title"),
+            2000,
+        )
+        title = _resident_action_text(raw.get("title") or summary, 180)
+        description = _resident_action_text(raw.get("description") or raw.get("content") or summary, 2000)
+        if not title or not description:
+            return None
+        source = "model_api_correction" if action_type == "memory.add_correction" else "hosted_runtime_state"
+        return {
+            "type": "memory.add_correction" if action_type == "memory.add_correction" else "memory.add",
+            "memory": {
+                "type": _resident_memory_type(raw),
+                "title": title,
+                "description": description,
+                "summary": summary,
+                "occurred_at": _resident_action_text(raw.get("occurred_at") or date.today().isoformat(), 80),
+                "source": _resident_action_text(raw.get("source") or source, 80),
+                "context": _resident_action_text(raw.get("context"), 1000),
+                "her_quote": _resident_action_text(raw.get("her_quote"), 1000),
+                "verbatim": _resident_action_text(raw.get("verbatim") or raw.get("her_quote"), 1000),
+            },
+            "reason": _resident_memory_reason(action, "Memory added from runtime action."),
+            "capture_mode": "state",
+        }
+
+    if action_type in {"memory.supersede", "memory.replace", "memory.correct"}:
+        memory_id = _resident_memory_id(action, payload, target)
+        if not memory_id:
+            return None
+        raw = _resident_memory_raw(payload)
+        summary = _resident_action_text(
+            raw.get("summary") or raw.get("description") or raw.get("content") or raw.get("title"),
+            2000,
+        )
+        if not summary:
+            return None
+        memory_payload: dict[str, Any] = {
+            "type": _resident_memory_type(raw),
+            "summary": summary,
+            "verbatim": _resident_action_text(raw.get("verbatim") or raw.get("her_quote"), 1000),
+            "occurred_at": _resident_action_text(raw.get("occurred_at") or date.today().isoformat(), 80),
+            "source": _resident_action_text(raw.get("source") or "hosted_runtime_state", 80),
+        }
+        context = _resident_action_text(raw.get("context"), 1000)
+        if context:
+            memory_payload["context"] = context
+        return {
+            "type": "memory.supersede",
+            "supersedes": memory_id,
+            "memory": memory_payload,
+            "reason": _resident_memory_reason(action, "Memory superseded from runtime action."),
+            "capture_mode": "state",
+        }
+
+    if action_type in {"memory.patch", "memory.content_patch"}:
+        memory_id = _resident_memory_id(action, payload, target)
+        if not memory_id:
+            return None
+        raw_patch = payload.get("patch") if isinstance(payload.get("patch"), dict) else payload
+        patch: dict[str, str] = {}
+        for key, max_len in (
+            ("title", 180),
+            ("description", 2000),
+            ("summary", 2000),
+            ("her_quote", 1000),
+            ("verbatim", 1000),
+            ("context", 1000),
+            ("follow_up", 1000),
+            ("type", 80),
+            ("occurred_at", 80),
+        ):
+            if key in raw_patch:
+                patch[key] = _resident_action_text(raw_patch.get(key), max_len)
+        if not patch:
+            description = _resident_action_text(
+                payload.get("description") or payload.get("content") or payload.get("summary"),
+                2000,
+            )
+            if description:
+                patch["description"] = description
+        if not patch:
+            return None
+        return {
+            "type": "memory.content_patch",
+            "memory_id": memory_id,
+            "patch": patch,
+            "reason": _resident_memory_reason(action, "Memory updated from runtime action."),
+        }
+
+    if action_type == "memory.delete":
+        memory_id = _resident_memory_id(action, payload, target)
+        if not memory_id:
+            return None
+        return {
+            "type": "memory.delete",
+            "memory_id": memory_id,
+            "reason": _resident_memory_reason(action, "Memory deleted from runtime action."),
+        }
+
+    return None
 
 
 def execute_scheduled_wake_actions(actions: list[dict], job: dict) -> dict:
@@ -3562,7 +3807,17 @@ def _process_messages(messages: list) -> float:
         else:
             log.info("user message [ts=%.3f]: %s", ts, content[:80])
 
-        screen_text, screen_payloads, screen_paths = _screen_context_for_message(content)
+        user_content_for_context = content
+        memory_text, memory_ids = _memory_recall_for_message(content)
+        if memory_text:
+            content = f"{content}\n\n{memory_text}"
+            log.info(
+                "attached IO long-term memory to agent message ts=%.3f cards=%d",
+                ts,
+                len(memory_ids),
+            )
+
+        screen_text, screen_payloads, screen_paths = _screen_context_for_message(user_content_for_context)
         if screen_text:
             content = f"{content}\n\n{screen_text}"
             image_payloads.extend(screen_payloads)
