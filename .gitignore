@@ -35,6 +35,8 @@ ios/vendor/dcap-qvl/target/
 
 # Local agent mailbox runtime (messages, inboxes, pane config)
 .agents/
+# Codex/agent local instruction file (not part of the repo)
+AGENTS.md
 buildServer.json
 deploy/backups/
 
