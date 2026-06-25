@@ -96,7 +96,7 @@
 
 **hx 直接上 VPS 的新流程(本次变更):**
 - 原计划:等 zhihao 改完 runtime/consumer 再加 VPS。**太慢、卡测试。**
-- **现在:hx 直接 HTTP-direct 上 VPS**(route A 本来就 HTTP-direct,不依赖 gateway)。skill 直接指 v1 端点、agent 自己 curl + 建 envelope。
+- **现在:hx 直接 HTTP-direct 上 VPS**(route A 本来就 HTTP-direct,不依赖 gateway)。skill 直接指 v1 端点、agent curl;**agent 只提交明文 action 到 `/v1/memory/actions`,服务端/enclave 建加密 envelope**(Codex 纠正:agent 不自建 envelope、不需 crypto)。
 - **能现在做**:改 skill + **老用户测 v1 读写**(老用户有卡,gate 能过)。
 - **还得等 Codex**:新用户跑通要 步骤 3 后端脱钩。
 - **zhihao 之后**:重构 consumer/runtime/gateway 时,吸收 hx 这版 HTTP-direct。

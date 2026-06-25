@@ -7,7 +7,8 @@
 
 ## 0. 依赖顺序(必读)
 **步骤 3(后端脱钩 gate)是步骤 1(skill v1)的前提** —— 不脱钩,新 VPS 用户写 v1 卡(小肚量)永远填不满 floor → onboarding 卡死。
-**本次决定:hx 走 HTTP-direct,不等 zhihao 的 gateway。** route A 现在本就 HTTP-direct(MCP 已删),skill 直接让 agent curl 原生 v1 端点 + 自建 envelope,**不依赖 gateway**。gateway(把端点注册成工具)= zhihao 后续重构时再加,**非本次前提**。
+**本次决定:hx 走 HTTP-direct,不等 zhihao 的 gateway。** route A 现在本就 HTTP-direct(MCP 已删),skill 直接让 agent curl 原生 v1 端点,**不依赖 gateway**。gateway(把端点注册成工具)= zhihao 后续重构时再加,**非本次前提**。
+**⚠️ 边界(Codex 纠正):agent 只提交结构化 action 到 `/v1/memory/actions`(明文 `{type, memory:{bucket,threads,summary,content,importance,pulse,source}}`),由服务端/enclave 建加密 envelope。agent 不拼 `body_ct`/`K_enclave`、不需要 crypto。** "agent 说要记什么,服务端负责怎么安全存"。(**route A HTTP-direct 是过渡形态,最终收敛 agent runtime,crypto/envelope 由 runtime/enclave 统一处理 → 本次不在 route A 纠结严格 E2E,仅需知会现状,不阻塞 Step 3。**)
 
 **开发可并行,但部署必须有序** —— 后端 gate 没先上,新用户还是被 floor 卡;skill 没改,agent 还按老端点调。**部署顺序(HTTP-direct 版):**
 ```
@@ -43,6 +44,8 @@
 **P6 退役分两步(不必同 PR 全删):**
 - **第一步(必做,随 Layer 1)**:gate / onboarding-validate / bootstrap-status 不再依赖 tab/floor。
 - **第二步(cleanup)**:退役 `/v1/memory/verify` 的 floor passing 语义、bootstrap 文案的 3 tab/6 type/floor、`TAB_FOR_TYPE`/`MEMORY_TYPES` 旧 gate 用法、`retype`/insight/reflection anchor 旧逻辑。
+  - **(Codex 复跑发现,2026-06-26)** `backend/admin/data_track.py` 仍有旧 memory floor 文案 —— 但是 admin/诊断展示路径,**非 runtime gate**,不挡 Step 3,归 P6。
+  - **(2026-06-26)** `test_bootstrap_gates.py` 4 个 verify/retype per-tab 测试已 `@pytest.mark.skip(P6)`(被 v1 `_count_by_tab` shim 退役,预存于 origin/test)—— 随 verify/retype 重做时一并改/删。
 
 **存量卡:不为 gate 迁移**(gate 以后不看 type/tab/floor);旧卡读取继续靠 adapter → v1。
 
@@ -93,6 +96,20 @@ feedling_memory_threads  → GET  /v1/memory/threads
 
 **1c. 顺带**:`skill-api.md` Acceptance 若提 floor 一并去(低优先);旧 stub skill 跳转占位不动。
 
+### Step 1 · Codex sanity-check 收(2026-06-26)· 开工前锁定
+**⚠️ 关键坑:identity 首次 init 不能 HTTP-direct 明文(和 memory 不同)**
+- memory:agent 提交明文 action → `/v1/memory/actions` → **服务端建 envelope**,无需 crypto。
+- identity:`/v1/identity/init` **仍要预建 `envelope`**(crypto);`/v1/identity/actions` 只支持 profile_patch / dimension_nudge / relationship_days_set,**不支持首次 init**。
+- → **skill 必须写清**:`Memory actions are server-enveloped (no crypto). Identity init may still require the existing crypto-capable identity tool/path until gateway/runtime standardizes it.` 否则后端 gate 已放行 0 记忆 identity,但 route A agent 实际写不了 identity → onboarding 走不完。
+- **后端 follow-up(另一轮)**:给 `/v1/identity/actions` 加「服务端建 envelope 的 init」→ 彻底闭环 route A HTTP-direct。
+
+**其它锁定**:
+- **`ambient` 不是真端点** → 映射 `/v1/memory/index` 无 query / 默认排序;别写成 `/v1/memory/ambient`。
+- **HTTP-direct 写法**:读 `POST /v1/memory/index`·`/fetch` + `GET /buckets`·`/threads`;写 `POST /v1/memory/actions` + `X-API-Key` + body `{type: memory.add|supersede|delete, ...}`;agent 不建 `body_ct/K_enclave/K_user`。
+- **范围(Codex)**:`skill.md`(全 v1)+ `skill-resident-agent.md` + `skill-hermes.md`(connection+validate 口径)+ `skill-api.md`(轻改)+ grep 全仓 `feedling_memory_add_moment/retype/verify`·`floor`·`Pass 1-4`·`type=`·`moment/quote/fact/event/insight/reflection`;`quickstart.md`/`troubleshooting.md` 至少标 stale。
+- **running capture / periodic review / push 段也引用旧 type** → 一并换 v1(capture 判断:稳定偏好/关系事实/边界/情绪模式/重要事件/未完线程;写结构 bucket/threads/summary/content/importance/pulse/source;冲突先 search/fetch 找 old_id 再 supersede;不写就 skip,不输出 noop)。
+- 执行顺序:skill.md → resident+hermes → api 轻改 → grep 清残留 → quickstart/troubleshooting 标 stale。
+
 ---
 
 ## 步骤 2 · Seven 内容接入(落卡 / Dream / eval)
@@ -110,7 +127,7 @@ feedling_memory_threads  → GET  /v1/memory/threads
 ## 部署 / 验证(HTTP-direct 版,有序)
 **并行开发,有序部署:**
 1. **① 后端 A' gate**(Codex)先上 test(非破坏性,旧 skill 仍活)—— 新用户硬前提。
-2. **② skill 改 HTTP-direct v1**(hx):agent curl 原生端点 + 原生 payload(`POST /v1/memory/actions {type:...}`)+ 自建 envelope;**老用户(gate 能过)现在就能测,不等 ①**。
+2. **② skill 改 HTTP-direct v1**(hx):agent curl 原生端点、**只提交明文 action**(`POST /v1/memory/actions {type:...,memory:{...}}`),**服务端建 envelope**;**老用户(gate 能过)现在就能测,不等 ①**。
 3. **③ Seven prompt** 接进 skill。
 4. **④ 验收**:
    - **老用户(可先测)**:存量 type 卡 → adapter 读出 v1 → `search/fetch/write` 跑通。
@@ -127,3 +144,16 @@ Codex 看完方案 + 真实代码,同意三步大方向,提了 4 约束,**已全
 4. **supersede 必须真实 target_id**(凭空不许 supersede)—— 见步骤 2。
 > type/tab 旧逻辑 Layer 1 不必一次删完,但 **skill/wrapper 一律走 `/v1/memory/actions`,不碰 `/v1/memory/add`+type**(否则拉回旧模型)。
 > **Codex 结论:补完这 3 处(工具名/validate三分支/部署顺序)即可开工,他落步骤 3 后端。** ← 已补完,可开工。
+
+## Codex review-2(2026-06-26)· 边界确认后再开工
+Codex 停在 review,同意 A' + HTTP-direct + 部署顺序,但要把 4 条**边界写进 plan** 才开工:
+1. **onboarding 不再卡 memory floor**(§步骤3,已写)。
+2. **`memory_garden` = informational / non-blocking**(§3.4,已写)。
+3. **⚠️ HTTP-direct 只提交 action,不自建 envelope** —— agent 提交明文 `{type, memory:{...}}` 到 `/v1/memory/actions`,**服务端/enclave 建加密 envelope**;agent 不拼 `body_ct`/`K_enclave`、不需 crypto。(已修 §0 + 步骤1 + 部署节的"自建 envelope"错。)
+4. **`/v1/memory/verify` 旧 floor 语义本次不动** —— 归 P6 cleanup,别混进这次。(本次只改 bootstrap / onboarding-validate / status 这层。)
+
+**执行前再查实的隐藏 gate / 残留**(Codex 列):`bootstrap/gates.py`、`/v1/onboarding/validate` 三 route(model_api/official_import/resident)、`/v1/bootstrap/status`、`context_memory_selection.py`、`memory_index_selector.py`、hosted/proactive 路径、**`feedling_onboarding_validate` 是否只调 `/v1/onboarding/validate` 还是有额外判断**。
+
+**最大风险 = skill 文案边界(不是后端 gate)**:① skill 若仍暗示"先写 memory 才能 onboarding" → 和后端新逻辑冲突;② skill 若让 agent 自建 envelope → 安全边界错;③ `/onboarding/validate` 若有第三隐藏 gate → 前端/agent 看到的状态和真实后端不一致。
+
+> **结论:边界已写进本文,Codex 可按 A' 落 Step 3 后端。**
