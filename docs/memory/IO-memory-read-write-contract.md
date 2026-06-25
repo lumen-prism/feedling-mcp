@@ -21,7 +21,7 @@
 
 | 层 | 是什么 | 谁强制 | 漂移风险 |
 |---|---|---|---|
-| **L1 服务端不变量** | action schema、规范化等价、supersede 原子/软删、anchor 门槛、敏感 gating、归档过滤、legacy 双写 | **后端代码 + conformance 测试**(机器强制) | 低(两 route 都穿同一组 HTTP 端点) |
+| **L1 服务端不变量** | action schema(add/supersede/delete)、规范化等价、supersede soft、bucket/thread filter、敏感 gating、status 过滤 | **后端代码 + conformance 测试**(机器强制) | 低(两 route 都穿同一组 HTTP 端点) |
 | **L2 agent 判断规则** | 何时读/写、create vs supersede、能否说"已记好" | **prompt/skill 文本**(人来守) | **高**——活在 route B prompt 和 route A skill 两处文本里 |
 
 > L2 才是抽合同的主要价值:**route B 的 hosted prompt 和 route A 的 onboarding skill,都从本合同 §2/§3 派生、并显式引用它。**
@@ -36,7 +36,7 @@
 - **R4 敏感 gating(v1 默认关闭)**:本 app v1 决定默认把敏感记忆当普通记忆处理,即 `MEMORY_SENSITIVE_GATING_ENABLED` 默认 off。off 时,`include_sensitive` 不影响 readside,index/fetch/selector 都不因 `is_sensitive` 过滤。
   - flag-on 时恢复从严门禁:`include_sensitive` 默认 false;agent 不得为"多补点上下文"主动打开 sensitive;只有用户**显式请求**、且请求本身就关于该敏感主题时,才允许取敏感卡。
   - flag-on 时,`index` 默认不返回敏感卡;`fetch` 按 id 取正文时也会在 enclave 解密后过滤敏感卡,并返回 `blocked_sensitive_ids` 便于观测。
-- **R5 兜底(recall)≠ 替代 agent-first**:agent 没自查时,consumer(route A)/ hosted fallback(route B)用**服务端 selector**(`/v1/memory/recall` 或进程内 `_select_context_memories_via_readside`,同一个 `select_memory_index_items`)推一小撮 baseline。**这是 floor,不是用来取代 agent 自己语义挑。** baseline 保持小;agent 仍应在需要更深时自查。
+- **R5 读 = agent-first,不做 recall/preflight**:默认 agent 会 call tool → 该查自己 `search→fetch`(query/bucket/thread),闲聊不查。**气氛灯 ambient = runtime push**(非 agent 查):`importance×pulse×recency` 无 query 取 top-N,会话开始带几条关系底色。identity 也常驻 push。(无 recall 兜底、无每轮 preflight、无 should_read。)
 
 **两 route 的读分工(机制不同、行为一致,详见定稿 §3.2)**:route B 看得见 tool_calls → 条件式(没调才兜底);route A 看不见 → 无条件推小 baseline + agent 自查叠加。**一致 = "agent 挑不出来时都有兜底",不是"两条都 always 双推"。**
 
@@ -44,21 +44,23 @@
 
 ## §3 写规则(L2,两 route 一致)
 
-**动作词分两层(别混)**:
-- **agent-facing 别名**:`memory.create` / `memory.supersede` / `memory.patch` / `memory.delete`(skill / prompt 里教 agent 用这套)。
-- **executor canonical action**:`memory.add` / `memory.supersede` / `memory.patch` / `memory.delete`。**`memory.create` 是 `memory.add` 的 agent-facing 别名**——执行层规范化时 `create → add`。
-- route A(`_normalize_v2_action_type`)和 route B(`coerce_runtime_action`)规范化后**必须产出同一个 executor action**(见 §4,conformance 测试守)。
+> **v1 结构定稿(merged Seven baseline)**:写入 = **agent-in-loop 主 + 服务端 capture 兜底,共用本 §3 一份规则**。**动作:`memory.add` / `memory.supersede` / `memory.delete`**(`memory.create`=`add` 别名;supersede = soft 软退场)。结构以 `IO-memory-v1结构定稿-bucket-thread.md` 为准。
 
-- **W1 何时不写**:寒暄、提问、玩笑、一次性/临时陈述、**或只是引用已有记忆**——**都不写**。不要每轮都写。
-- **W2 create**:出现一条**新的、持久的事实**(宠物/人/地点/偏好/长期身份事实/关系状态等)。要 grounded、会长期成立。
-- **W3 supersede**:新陈述**替换/纠正**一条已有事实时用它(换工作、改口、纠错)。**永不硬删**——旧卡软退场 + 链到新卡(后端原子执行,见 §4)。
-- **W4 patch**:在**不改变卡身份**的前提下补充/修正已有卡的字段(加细节、补 follow_up)。
-- **W5 delete**:**罕用**。仅用于明确错误/用户明确要求遗忘的条目。**纠正旧事实优先 supersede,不要用 delete。**
-- **W6 anchor 门槛(涉及推理类卡)**:`insight` 需 ≥1 anchor;`reflection` 需 ≥2 anchor 且受频率上限(后端强制,见 §4)。(注:insight/reflection 属"agent 推理"类,受格式议题影响,本合同不冻结其分类。)
-- **W7 去重**:该事实已有卡 → 用 patch/supersede,**不要 create 出重复卡**。
-- **W8 时序 +「已记好」规则(重要)**:**写是回复之后才提交的(尤其 route A:consumer 在回复后才 `POST /v1/memory/actions`)。agent 在回复那一刻并不知道是否落库成功。**
-  - → **不要在回复里把"已保存/已记好"当既成事实说。** 要么说成意图("我记一下""我会记住"),要么不提。
-  - → 只有在确实拿到成功的 actions 响应后,才可确认已存(route A 通常看不到该响应,故默认按"说意图")。
+- **W1 何时不写**:寒暄、提问、玩笑、一次性/临时情绪、**只是引用已有记忆**、**agent 自己没被用户确认的推测**、角色扮演/假设——**都不写**。不每轮都写。
+- **W2 事件即记忆,不分 type;归 bucket + 挂 thread**:
+  - 记**一件完整的事**(人/事/情绪/过程);fact/relationship/insight **用 thread 贴标签,不做卡 type**。
+  - `bucket`(**单选**,主话题):**优先复用现有桶**(写入提示会注入现有 bucket 列表),没有才新建,克制别造近义。
+  - `threads`(**多选** 1–4,线索/人物/情绪/关键点):**优先复用现有线**;同一条线一个名(`蛋子` 不写成 `狗狗`)。
+  - 稳定设定/称呼/边界 → 进 **identity**(或提议 identity 更新),不是普通 memory。
+- **W3 importance + pulse 打分**:
+  - **`importance` 0–1 = "看不看"**(对长期理解用户多重要,**不是语气**;客观、不随时间变):0.1–0.3 普通事实 / 0.4–0.6 偏好宠物生活 / 0.7–0.85 情绪关系边界 / 0.9–1.0 强情绪核心边界危机。
+  - **`pulse` 0–1 = "想起来时情绪多强/多激活"**(只影响 agent 表达色彩,**不进检索排序**)。
+- **W4 content 格式**(固定 MD 三段):`记忆:` + `上下文:` + `使用提示:`。`summary` 一句话短摘要,只给 index。
+- **W5 纠错 = `memory.supersede`(soft)**:用户改口/纠正旧事实 → `supersede(target=旧卡id, memory=新卡)`;**旧卡 `status=superseded`、链到新卡、永不硬删;新卡继承旧卡 bucket/threads**。
+- **W6 delete**:仅用户明确要"删/遗忘"才真删。
+- **W7 去重**:同一事实已有卡 → 用 `supersede` 更新,不 `add` 重复。
+- **W8 时序 +「已记好」规则**:写是**回复后异步提交**,agent 当下不知是否落库 → **不要把"已保存/已记好"当既成事实说**,说成意图或不提。
+- **规范化等价**:route A(`_normalize_v2_action_type`)/ route B(`coerce_runtime_action`)对 `memory.add/supersede/delete` 规范化后**必须产出同一 executor action**(§4 conformance 守)。
 
 ---
 
@@ -66,20 +68,35 @@
 
 这些后端已强制(除标⚠️者),**两 route 自动一致**(都走同一组 HTTP 端点)。**改这些必须同步改对应 conformance 测试。**
 
-**写入口有两个,别混(写规则只走前者)**:
-- **`POST /v1/memory/actions` = agent/runtime 统一写入口**:收 `memory.*` 动作 → 规范化(route A `_normalize_v2_action_type` / route B `coerce_runtime_action`)→ executor `_execute_memory_actions`。**§3 的写规则、A/B 一致性、conformance 都指这条。**
-- **`POST /v1/memory/add` = legacy / envelope 直写入口**:直接收 envelope(密文 inner + 明文 `occurred_at/source/type`)落库,**不经 executor、不做 `memory.*` 规范化**。属遗留路径,**不在 §3 写规则约束内**,新逻辑不要往这条加。
+> ⚠️ **本节为 v1 结构定稿版**(bucket/thread + importance/pulse + supersede soft;删 anchor 门槛 / legacy 双写)。
 
-| 不变量 | 代码 | 测试 |
-|---|---|---|
-| action schema + **route A/B 规范化等价**(经 `/v1/memory/actions`) | `tools/chat_resident_consumer.py:_normalize_v2_action_type` / `hosted_runtime.py:coerce_runtime_action` | `tests/test_memory_action_conformance.py`(断言两者产出同一 executor action) |
-| recall = index→selector→fetch,复用同一 selector | `backend/memory/routes.py:/v1/memory/recall` + `memory_index_selector.select_memory_index_items` | `tests/test_memory_recall_route.py`、`tests/test_memory_index_selector.py` |
-| readside 候选/排序/limit(默认 50 / 0=全开 / HARD_MAX) | `backend/memory_readside_core.py:readside_candidates / effective_readside_limit` | `tests/test_memory_readside_core.py`、`tests/test_memory_readside.py` |
-| **敏感 gating(flagged)**:`MEMORY_SENSITIVE_GATING_ENABLED` 默认 off,off 时敏感=普通;flag-on 时 `index` 默认 `include_sensitive=false`, `fetch` 按 id 取时也默认过滤敏感正文,被挡 id 返回 `blocked_sensitive_ids`;只有显式 `include_sensitive=true` 才允许取敏感正文 | `memory_readside_config.effective_include_sensitive`;`index` 侧:`memory_index_core` + enclave `v1_memory_index`;`fetch` 侧:`memory_fetch_core` 透传 `include_sensitive` + enclave `v1_memory_fetch` 解密后过滤;selector 侧:`memory_index_selector` | `tests/test_memory_readside.py`、`tests/test_memory_readside_core.py`、`tests/test_memory_index_selector.py` |
-| 归档/superseded 不返回 | `memory_service._active_memory_moments` / `memory_available`(`is_archived`/`status`/`superseded_by`) | `tests/test_memory_m2_write_loop.py` |
-| supersede 软退场 + 原子(旧卡 `status=superseded`+`superseded_by`+`is_archived`,永不硬删) | `backend/memory/actions.py:_memory_supersede_action` | `tests/test_memory_m2_write_loop.py` |
-| anchor 门槛(insight≥1 / reflection≥2 + cadence) | `backend/memory/service.py`(`_validate_anchor_ids` / `_reflection_time_cap_ok`) | (随写入闭环测试) |
-| **legacy 双写**(`title/description/her_quote`)保 iOS Garden | `backend/memory/actions.py:_memory_inner_from_action` | `tests/test_memory_m2_write_loop.py` |
+**写入口(v1)**:
+- **`POST /v1/memory/actions` = agent/runtime 统一写入口**:收 `memory.add` / `memory.supersede` / `memory.delete` → 规范化(route A `_normalize_v2_action_type` / route B `coerce_runtime_action`,**产出等价**)→ executor。
+- **`POST /v1/memory/add` = legacy envelope 直写**:只给**旧 iOS / import**,不进新工具契约。
+- **`list / get / delete` 保留给 Garden**(看详情 / 删记忆)。
+
+**旧动作降级**(短期兼容,防旧 prompt 没清干净就断):
+```
+memory.create         → memory.add
+memory.add_correction → memory.add
+memory.supersede      → 支持(soft:旧卡 status=superseded、链新卡、不硬删)
+memory.patch          → memory.supersede(改记忆=退旧立新,不做字段级 patch)
+memory.retype         → 400 unsupported
+```
+
+**L1 不变量(v1)**:
+| 不变量 | 说明 / 代码 / 测试 |
+|---|---|
+| action `add`/`supersede`/`delete`(create=add 别名)+ **A/B 规范化等价** | `_normalize_v2_action_type` / `coerce_runtime_action`;`tests/test_memory_action_conformance.py` |
+| 字段:`bucket`(string,单选)、`threads`(string[],多选)、`importance`/`pulse ∈ [0,1]`、`status`、`source ∈ {chat,screen}`、`occurred_at`、`last_referenced_at` | 写入校验 |
+| `content` = MD 三段;`summary` 短摘要 | — |
+| `decay` 读时从 `last_referenced_at` 派生(不存、无后台任务);排序 ≈ 相关性×importance×(1-decay);**pulse 不进排序** | v1 定稿 §2 |
+| **supersede soft**:旧卡 `status=superseded`+链新卡、**原子、永不硬删**;新卡继承 bucket/threads | `memory/actions.py:_memory_supersede_action`;`tests/test_memory_m2_write_loop.py` |
+| readside:**支持 `bucket` / `thread` filter**;**`index` 只返回摘要(不含 content),`fetch` 才返回 content**;**`limit` 可配(默认放宽 / 0=全),不 hardcode 50**;`status≠active` 不返回 | `memory_index_core` / `memory_fetch_core` |
+| **`follow_thread` = `index(thread=X)` 过滤**(跨 bucket),非独立端点 | `memory_index_core` |
+| 读 = `index`(目录,无 content)→ agent 挑 → `fetch`(content);**无 recall/preflight**;气氛灯=`index` 无 query 按 `importance×pulse×recency` 取 top-N(runtime push)| `memory_index_core`/`memory_fetch_core`;`memory_index_selector` |
+| 敏感 gating:`MEMORY_SENSITIVE_GATING_ENABLED` 默认 off | `memory_readside_config`;`tests/test_memory_readside*.py` |
+| **resolve-before-create**:`GET /v1/memory/buckets\|threads`(或聚合现有卡)给写入提示注入现有词表 | 新增小能力 |
 
 ---
 

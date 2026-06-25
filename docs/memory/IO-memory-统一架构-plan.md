@@ -1,3 +1,5 @@
+> ⚠️ **已被取代** —— 见 **`IO-memory-子系统-spec与plan-定稿v1.md`**(冲突以定稿为准)。本文保留备查。
+
 # IO Memory 统一架构 · 执行 Plan(5 阶段)
 
 > 2026-06-23 · 作者:Claude(CC) · 状态:**待 Codex review**(架构见 `IO-memory-统一架构-spec-给codex-review.md` v2)

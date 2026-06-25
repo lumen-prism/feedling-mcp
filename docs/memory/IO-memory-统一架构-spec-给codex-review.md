@@ -1,3 +1,5 @@
+> ⚠️ **已被取代** —— 见 **`IO-memory-子系统-spec与plan-定稿v1.md`**(冲突以定稿为准)。本文保留备查。
+
 # IO Memory 统一架构 Spec(route A/B 收敛)
 
 > 2026-06-23 · 作者:Claude(CC) · 状态:**v2 · Codex 已 review · plan-ready**(配套执行 plan 见 `IO-memory-统一架构-plan.md`)
@@ -8,7 +10,7 @@
 ## 0. 背景与动机(请先读,Codex 理解上下文用)
 
 ### 0.1 为什么做(领导的驱动)
-**Seven 认为 route A(VPS/自建)和 route B(API/托管)两套路径差异已经太大,"像是两个不同的 app 了"。** 记忆逻辑在两条路上各长各的——提取各写各的、动作协议各有一套、route A 甚至没接召回。这份 spec 的唯一目标:**收敛差异,让记忆变成"一条写管道 + 一条读管道,所有来源都汇进去"**。一个词:**统一**。
+**xyn 认为 route A(VPS/自建)和 route B(API/托管)两套路径差异已经太大,"像是两个不同的 app 了"。** 记忆逻辑在两条路上各长各的——提取各写各的、动作协议各有一套、route A 甚至没接召回。这份 spec 的唯一目标:**收敛差异,让记忆变成"一条写管道 + 一条读管道,所有来源都汇进去"**。一个词:**统一**。
 
 ### 0.2 已经做到哪了(已完成的前序工作)
 - **M1**:readside 召回拆成 `index → fetch`,enclave 内解密。✅ 上 test。
@@ -32,6 +34,31 @@ Codex review 后,以下调整已折叠进本 spec + plan:
 - (G2) Phase 1 给 route A 接召回注入 = route A 的**真行为变化**(原来只用 agent 自己记忆)→ 冒烟 + 盯 prompt token 膨胀。
 - (G3) **"propose 跟着谁是 agent 走"**:共享的是规则文本;**不要把"服务端替 route A 跑 propose"做进去**(那是多一个 LLM,违背 route A 自带算力)。
 - (G4) MemPalace POC = **条件性/可选**(M3 后召回成瓶颈才做),非必交付。
+
+### 0.5 对齐 xyn runtime 统一(v3,2026-06-23)
+本 spec **降级为"记忆子系统视角"**,顶层以 xyn 的 `RUNTIME_UNIFICATION_SPEC` + `RUNTIME_ACCEPTANCE_REQUIREMENTS` 为准。记忆是 xyn 的 **`build_companion_context`(identity+memory+screen+recent+pending)** 里的一个零件,不再自成一套。对齐清单:
+
+**① 缺、要补进本 spec:**
+1. **唤醒(proactive)时的记忆**:本 spec 原来只想了"聊天召回",**没想唤醒**。读侧必须同时服务**聊天 + 唤醒**(对应 xyn P3:唤醒现在硬编码 `memory_count=0`,要真填)。
+2. **屏幕→记忆(感知沉淀)提前**:本 spec 原把它放 P4/M3 后;xyn 放 **Phase A(A4,分给 hx),现在做**(跨天逛街例子是核心验收)。
+3. **记忆要和 screen/identity 在同一个 context**:不再是独立召回管道,是 `build_companion_context` 的 memory 输入,和屏幕/身份平级。
+4. **常驻层**:读侧长期 = `常驻(identity / pinned)+ 召回`,不只召回(详细设计 parked,见 `IO-runtime统一-CC对齐` §6)。
+
+**② 要改:**
+1. 我们的"上下文拼装器"**并进 `build_companion_context`**,不自成一套。
+2. **selector 后端化、一套**:`/v1/memory/recall` 给**聊天 + 唤醒、A + B 全用同一个**(consumer 不再自己 topK)。
+3. 读侧模型 `短期 + 长期(召回)` → `短期 + 长期(常驻 + 召回)`。
+4. **送达 = consumer-push 默认开**(见下"方式")。
+
+**③ VPS agent 用工具的最终方式(双层)**:
+- **底座 = consumer-push(保证)**:consumer 每轮把 `build_companion_context` 推进甩给 agent CLI 的消息——不管 agent 会不会调工具,一定看到。
+- **增强 = MCP-pull(best-effort)**:把**新的** `feedling_memory_index/fetch` 配进用户 agent runtime(onboarding `claude mcp add`/Hermes)+ skill 叮嘱,强 agent 自己深挖。
+- ⚠️ **真 gap**:onboarding 现在配的是**老 memory 工具**(add_moment/list),新的 index/fetch 要配进去,pull 这层才真能用。
+- 写:agent 发动作 + 周期 capture 兜底(不变)。
+
+**④ 对齐了不用动**:写入(M2 commit)、共享契约不跨进程 import、MemPalace 不进主链路(=xyn P9/C2)、弱模型服务端兜底(=xyn B1)。
+
+**⑤ 归位到 xyn 的 Phase**:本 spec 的 readside+recall = **A1 的 memory 部分**;感知→记忆 = **A4**;agentic+tool-loop = **B1**;写入/质量 = A4/后续。(hx 负责 A1+A4)
 
 ---
 
