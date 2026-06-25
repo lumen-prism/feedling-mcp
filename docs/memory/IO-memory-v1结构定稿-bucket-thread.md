@@ -30,7 +30,7 @@
 | `threads` | 索引 | **线索(多选,string[])**:`工作压力`/`蛋子`/`冷战`…。**既是检索抓手,也是 follow_thread 横穿桶的连线**(thread ≈ tag,多选) |
 | `summary` | 索引 | 一句话:这卡是啥(agent 一眼判断要不要进去读) |
 | `importance` | 视标 | **0–1:看不看**(对长期理解用户多重要)。**写时模型打,客观、不随时间变** |
-| `pulse` | 视标 | **0–1:回忆时的情绪强度/激活度**。**只影响 agent 表达色彩,不进检索排序**(§9 待确认) |
+| `pulse` | 视标 | **0–1:这件事在 AI(陪伴者)自己心里激起多大波动**(不是用户多激动,是 TA 多被触动;Seven 定稿口径)。**只影响表达色彩 + 气氛灯挑选,不进检索排序** |
 | `status` | 视标 | `active`/`superseded`/`archived`。非 active 默认不返回 |
 | `source` | 视标 | `chat`/`screen`(grounded 出处;推理/猜测不在这,进推理层) |
 | `occurred_at` | 视标 | 发生/创建时间 |
@@ -122,7 +122,7 @@
 
 ## 9. 待 Seven 确认(只剩 2 个)
 1. **bucket 平铺 vs 层级**?baseline 写了"三层"又写"平铺/几十个"——我理解"三层"指**整体架构三层**(身份/索引/内容),**bucket 本身平铺**。建议平铺(§7)。**确认?**
-2. **pulse 进不进检索排序**?你说"不影响看不看",我定成 **pulse 只影响表达色彩、不进排序**(排序只 importance×recency×activation)。**对吗?**
+2. ~~pulse 进不进检索排序~~ **已定(Seven)**:pulse = AI 自己被触动多大,**不进排序**,只影响表达色彩 + 气氛灯挑选。
 > 其余已对齐:importance/pulse 拆、supersede soft、底色=最近+高importance、bucket 单选 + thread 多选 + 写时复用现有词表、limit 可配。
 
 ---
