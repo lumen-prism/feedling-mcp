@@ -6,6 +6,19 @@
 
 ---
 
+## 现状(2026-06-25 已合 test)—— 先看这个
+后端 v1 **已实现并合并 test**(Codex 实现 / CC review / DB 测试绿)。所以本文里"v1 需改/需新增"的措辞**大多已完成**;你看的是**消费侧契约**,不是待建清单。真实状态:
+
+| 已 live(route B) | 你(zhihao)要接的 |
+|---|---|
+| 写:capture→coerce→v1 卡(add/supersede/delete)| **读接进 loop**:agent-first index/fetch + 气氛灯 ambient,**替掉**老的 `backend/context_memory_selection.py` 自动注入(**目前线上读还是老的**)|
+| `prompts_v1` 写入指引 + bucket/thread 词表注入(`existing_memory_terms`)| **挂 route A 同份合同**:consumer 不硬塞 prompt(有意,防污染用户输入),route A 读写规则由你 runtime/tool/skill 挂载 |
+| 端点 index/fetch/actions/**buckets/threads** 全在,支持 bucket/thread/ambient 参数 | runtime token→用户 的 tool gateway 鉴权翻译(走 A) |
+
+**一句话:写 + 工具 + 端点 = 已 live;读接进 loop + 替老注入 = 你的活。合并 ≠ 线上读自动变 v1。**
+
+---
+
 ## 0. 和统一 Agent Runtime 的关系(Codex 补充)
 
 zhihao 的 runtime 计划里,API 用户不再长期依赖"一次 LLM call + 手搓 JSON 协议"的旧 hosted path,而是:
@@ -72,11 +85,10 @@ feedling_identity_get()                                    # 包 /v1/identity/ge
 | `feedling_memory_threads` | `GET /v1/memory/threads` | v1 需新增,从现有卡聚合 |
 | `feedling_identity_get` | `GET /v1/identity/get` | 已有;runtime 每轮常驻 push |
 
-**Codex 现状核对**:
-- `feedling-mcp` 当前有 `/v1/memory/index`、`/v1/memory/fetch`、`/v1/memory/actions`。
-- `io-onboarding/skill.md` 当前仍是旧工具名:`feedling_memory_add_moment/list/get/verify/retype`。
-- `backend/agent_runtime/` 和统一 tool gateway / MCP server 还没在当前代码里落地。
-- 所以 v1 要做两层:先把 backend HTTP 能力建好;再由 zhihao 的 agent-runtime tool gateway 包成上述 `feedling_memory_*` 工具。
+**现状核对(2026-06-25 已合 test)**:
+- `feedling-mcp` 现有 `/v1/memory/index`、`/fetch`、`/actions`、**`/buckets`、`/threads`**(均 v1;index 支持 `bucket`/`thread`/`ambient` 参数;fetch 回写 `last_referenced_at`)。
+- `io-onboarding/skill.md` **仍是旧工具名**(`feedling_memory_add_moment/list/get/verify/retype`)→ **待更新成 v1 协议(hx/zhihao)**,否则 route A 用户写入质量跟不上 route B。
+- `backend/agent_runtime/` / 统一 tool gateway 仍由你 runtime 侧落地;**backend HTTP 能力已 v1-ready**,直接包成 `feedling_memory_*` 即可。
 
 ---
 

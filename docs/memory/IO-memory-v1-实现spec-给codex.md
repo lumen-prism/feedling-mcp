@@ -132,3 +132,69 @@ perception/proactive 核心逻辑 + 命名、hosted_context 主函数、别人 1
 
 ## 给 CC review 的产出
 每个 P 的 diff + P5 测试结果;P6 删除前确认 P4 readers + P5 测试都过。
+
+---
+
+## 复核补丁项(CC review 2026-06-25,合并前必补)
+> 首轮实现(`feat/memory-v1-clean-schema`)整体忠于 spec,两层 adapter + bucket/thread filter 不预截都已落实。以下 3 项缺口 + 备注需补后再合。
+
+**① decay + fetch 强化回写 = 没实现(P2 核心机制)**
+现状:全仓无 `half_life`/decay 计算;`last_referenced_at` 只当排序 tiebreaker;`memory_fetch_core` 取完卡**没回写 `last_referenced_at=now`**。结果 agent 排序退化成 `importance`(+recency),spec 的 `importance×(1-decay)` 和"被用到回升"都丢了。
+→ **至少补 fetch 后强化回写**(fetch 真返回的卡 → `last_referenced_at=now`,只在 fetch 路径、不在 index);decay 乘子要么补、要么**有意识推后并同步进结构定稿/本 spec**(别静默丢)。
+
+**② `memory_index_selector.py` 没更新,引用 v1 已删的 `bucket_refs`**
+现状:selector 用 `bucket_refs` 拼 topic-guard 与相关性文本;v1 item 已是 `bucket`/`threads` → topic-guard 静默失效、bucket 掉出相关性,只剩 summary 匹配。不报错但 **agent search 质量降级**。
+→ selector 改读 `bucket`/`threads`。
+
+**③ `GET /v1/memory/buckets|threads` 没建(P2 / resolve-before-create 命门)**
+现状:routes.py 没动;`prompts_v1` 写了"Prefer existing bucket/thread names when provided" 但**无数据源 provide**。→ 防词表膨胀的 resolve-before-create 落不了地。
+→ 加这俩端点(从现有卡聚合)+ 把现有词表喂进写入路径;或明确推后(并承认这一刀词表膨胀没兜)。
+
+**备注(小)**
+- **patch→supersede** 部分 patch 只继承了 bucket/threads/importance/pulse,**没继承旧 summary/content** → 只改一字段的 patch 会丢旧正文。缺字段时从旧 inner 补,或要求 patch 带全 content。
+- `_memory_record_from_envelope` 删了 `type` 但 supersede 仍 set `envelope["type"]` —— 无害残留(type 本 P6 删),记一笔。
+- v1 新测试需确认本地跑绿(CC 因缺 pytest/Postgres 环境未执行)。
+
+### 第二轮复核(CC 2026-06-25,①②已修,③补一半)
+①decay+fetch强化回写、②selector读bucket/threads、③buckets/threads端点 —— 已修好。③ 还差后半:
+- **(a) `prompts_v1` 没被任何地方 import** → v1 写入/注入指引没接进 route A skill / route B hosted 实际提示词,当前 inert(靠 coerce 兜底落库,不报错但新指引没到模型)。→ 接进提示词组装(至少把 `MEMORY_WRITE_GUIDANCE_V1` 拼进 system prompt),给 Seven 留 live 挂载点;**或明确交接 Seven 并记此**。
+- **(b) resolve-before-create 未闭合**:端点有了但**写入时没注入现有 bucket/thread**(prompts 里 "when provided" 永远没人填)→ 防词表膨胀机制实际没生效。→ 写入路径用新端点注入现有词表;**或明确推后并承认这一刀不兜词表膨胀**。
+> **(a)(b) 确认交接 Seven**(他在 v1 memory 上接他的提示词)。Codex 不写最终提示词,只**留干净 live seam**:把 `prompts_v1` import 进 route A/B 提示词组装做占位(别悬空 inert)、buckets/threads 端点已在。Seven 来填内容 + 决定现有词表怎么注入写入提示。→ **(a)(b) 从合并 blocker 降级为交接项。**
+
+---
+
+## 合并到 test 的次序 + 跨-repo 待办(hx 2026-06-25)
+> 后端 v1 分支(P1–P4 + 补丁)自洽,但 **合到 test = 部署到线上 test app**。会撞 3 个**没做的跨-repo 活**。**推荐次序(选项1)**:
+
+**合 test 前先做:**
+1. **iOS P7:隐藏/改 Garden**(repo `feedling-mcp-ios`,hx)。原因:Garden 按老字段(type/title/description/tab story·about_me·ta_thinking)渲染;v1 卡是 summary/content/bucket/threads → 不隐藏就渲染空/错。**P7 本就是为了让这个坏掉不要紧。**
+2. **onboarding skill 改 v1**(repo `io-onboarding`,`skill.md`)。原因:分发给用户 agent 的记忆协议还是老的(应改成 add/supersede + bucket/thread + index/fetch + ambient,鉴权走 A)。**spec 原先漏了 onboarding,现补列。**
+3. **旧 HTTP 端点对账**:`/v1/memory/add`(老 schema,bootstrap/iOS 在用)、`/v1/memory/verify`(还跑 tab floors)Codex **没动**。确认 bootstrap/iOS 走 `/add` 写的老卡能被 adapter 读(能),`/verify` 的 tab floor 退化可接受(三 tab 都=total),否则一并改。
+
+**合并后线上影响**:agent 聊天记忆升级 v1 ✅;老卡走 adapter ✅;perception/proactive 有 shim ✅;**iOS Garden 坏**(到 P7);onboarding skill 过时(到 §2);`/verify` tab 退化但不崩。
+
+**若坚持先合**(选项2,睁眼合):接受 test app Garden 暂坏 + 先跟 liko/zhihao 打招呼 + onboarding skill 必须同步,否则新用户 agent 拿错协议。
+
+### 下游分工(谁在 hx memory v1 上接什么)
+- **hx** = memory v1 后端(schema/工具/端点/写入)—— 地基,本 spec 范围。
+- **zhihao** = 把 v1 **读**(agent-first index/fetch + 气氛灯 ambient)接进 runtime loop、**替掉**老的 `context_memory_selection` 自动注入。→ **合并后线上"读"变 v1 靠这步,不在本 spec。**
+- **Seven** = 在 v1 memory 上**迭代 Garden UI**(把老 type/title/tab 渲染换成 bucket/thread/summary/content)+ **接他的提示词**(prompts_v1 hook = (a)(b))。
+- **P7(iOS 隐藏 Garden)**= hx 过渡手段(让 Garden 暂坏不要紧),最终 Garden 重做 = Seven。
+
+### 合并就绪结论(CC 2026-06-25,实查 iOS 解码 + 老数据后)
+**1. 合 clean v1 到 test 不会崩、不影响运行(无 iOS 前置)。**
+- 实查 iOS `MemoryMoment.init(from:)`(`feedling-mcp-ios/.../Garden/MemoryViewModel.swift`):**只有 `id`/`occurred_at`/`created_at` 硬必填**(v1 全保留);`type`/`title`/`description`/body_ct 字段全是 `try?` 兜底。→ v1 卡解码**不崩**,Garden 不挂。
+- chat(routeB)读老注入对 v1 卡读不到 title = 空内容(`.get` 兜底),**不崩**。
+- **代价 = cosmetic**:v1 卡在 Garden 显示空白、落默认 tab —— Seven 重做样式的起点,非 break。
+- **合并仅 2 个硬条件**:① v1 测试绿;② `prompts_v1` 接成占位 import(别悬空 inert)。(P7 隐藏 Garden = 可选过渡美化,非"不崩"前提。)
+
+**2. 老数据 = 自动兼容、零迁移。** 懒加载两层 adapter,老卡每次读自动出 v1(`title→content`/`type→bucket`/`linked·anchor→threads`)。**无 /migrate、无脚本、不阻塞、不改 body_ct。** 代价:老卡桶/线是默认值(多落"未分类"),组织质量低 → 想漂亮靠以后 **LLM 回填**(未建,可选,后置)。
+
+**3. onboarding 分工**:设计层(种子记忆/呈现/提示词)= **Seven 主导**;架构层(bootstrap 写 v1 卡、删 tab/floor/verify)= **zhihao**(后端)。⚠️ 若指 `io-onboarding` 的 **routeA skill**(给用户 agent 的协议)= **hx/zhihao**(runtime/工具层),非 Seven,别混。
+
+**4. 合并后线上实际**:写=v1 live(coerce 接在 loop);读=还老注入(等 zhihao 接 v1 读 + 替 `context_memory_selection`);气氛灯=能力在、没人 push(等 zhihao)。**合并≠线上读自动变 v1。**
+
+### ✅ 合并 GO 判定(CC+Codex 2026-06-25)
+代码层无硬崩点;(a)(b) 已接 live(route B);老数据零迁移;**测试全绿**:非 DB `81 passed` + DB-backed(真 PG `127.0.0.1:55432`,escalated 跑)`78 passed`(覆盖 db/identity/v1 schema·readside·readers/conformance/m2/readside_core/index_selector)。
+→ **唯一剩一步**:吸收最新 `origin/test`(当前 behind 2,均 perception/image 非 memory)→ 同套测试重跑绿 → **合**。
+合后:route B 写=满血 v1、读=等 zhihao;route A 写=v1 schema、写入指引等 skill 更新(hx/zhihao);Garden 空白等 Seven。

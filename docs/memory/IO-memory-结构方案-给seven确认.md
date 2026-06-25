@@ -5,6 +5,19 @@
 
 ---
 
+> ⚠️ **2026-06-25 更新:本文 6/24 旧稿,字段名/确认点都变了,别照本文实现。** 现状 + 你的活看这段:
+>
+> **结构已定稿 + 后端已实现并合 test**(CC+Codex)。最终命名变了:`kind` → **bucket(单选话题)+ threads(多选线索)**;`emotion_weight` → **importance(看不看)+ pulse(情绪强度)**;**supersede soft 回归**(不再"靠日期判断改口")。**准确结构以 [`IO-memory-v1结构定稿-bucket-thread.md`] 为准。**
+>
+> **你(Seven)现在的活:**
+> 1. **Garden UI 重做**:按 v1 渲染(bucket / threads / summary / content,**不再 type/tab**)。合并后 Garden 会显示**空白 v1 卡**(不崩,iOS 兼容解码兜底)→ 等你重做样式 + 把 iOS model 从兼容解码升级成正式 v1。
+> 2. **提示词**:写入/注入指引集中在 `backend/memory/prompts_v1.py`(**已接进 route B,占位文本**)——**你整段替换/迭代**。现有桶/线注入(resolve-before-create)已接好,你调措辞即可。
+> 3. **2 个待你拍**(结构定稿 §9):① bucket 平铺 vs 层级(建议平铺);② pulse 进不进检索排序(现定:不进,只影响表达色彩)。
+>
+> 下面 §1–§6 是旧稿(kind/emotion_weight/请你确认),**仅备查**,确认点早已拍定。
+
+---
+
 ## 1. 一句话结构
 
 **记忆 = 一种极简卡(不再分 6 种 type);"我们的关系/人设"= identity(单独、用户控制);TA在想(推理)先不做。检索 = agent 自己挑;Garden = 用户的控制台。**
