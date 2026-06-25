@@ -28,7 +28,7 @@
 - ~~[记忆 v1 · 整体实施方案(纯净分支)](IO-memory-v1实施方案-给codex-纯净分支.md)~~ — **被实施计划取代**(从 main 切 + 删死代码 那套已不适用;能力/编排三分仍可参考)
 - **[记忆系统 · 完整设计与现状 vNext](IO-memory-完整设计与现状-vNext.md)** — 记忆模型主设计稿(4 轴框架 + 块一~四 + 待拍决策点);v1 极简重做是它收敛后的落地版。
 - **[记忆+感知 · 模块分工 hx↔zhihao](IO-memory感知-模块分工-hx与zhihao.md)** — 对照 xyn P1–P9:hx=记忆大脑 / zhihao=感知+落库+喂入 / A4 屏幕→记忆=交界面;含状态表 + A4 接口草图。给 zhihao 看。
-- ~~[记忆结构方案 · 给 Seven 确认](IO-memory-结构方案-给seven确认.md)~~ — **被结构定稿取代**(发 Seven 改用上面的"结构定稿",§9 有给她的 2 个确认问题)
+- **[记忆 v1 · 给 Seven(Garden UI + 提示词)](IO-memory-结构方案-给seven确认.md)** — ⭐ 面向 Seven 的 v1 精简版(**已重写**,去掉旧 kind/relationship/emotion_weight);结构准确版见结构定稿,这份讲她的活(Garden v1 + prompts_v1 + 2 待拍)
 - [记忆模型大改 = 一个问题(讨论稿)](IO-memory-记忆模型大改-一个问题-讨论稿.md) — vNext 的精简版/前身(伞文档)
 - [记忆格式 / type / tab / index 议题(给 Codex)](IO-memory-格式与tab-议题-给codex看.md) — 格式/tab 深稿(统一格式 + tab=读模式)
 
