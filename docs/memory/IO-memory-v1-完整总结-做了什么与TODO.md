@@ -135,9 +135,11 @@ IO 后端 + Enclave          ← 端点/工具 + 写时建信封 + 读时 enclav
 3. 从 `memory-m-http-skills` 摘:`io_cli.py perception` 注册为 runtime native tool、memory HTTP readiness/smoke、`agent_name` vs runtime label 分离。
 4. 删 `memory-m-http-skills`,合 skill-memory-v1 → main。
 
-### 7.5 test → main 大发布(v1 上生产)
-- `test` 领先 `main` 约 188 commit(含 memory v1 + A' + identity-init + 感知 + iOS 等,**不止 memory**)。
-- 这是 v1 真正上生产的动作,**需团队对齐时机**(大批量、混了多人工作)。
+### 7.5 test → main(最终合并,**非特别动作,现在不用操心**)
+- **当前主线就是 `test`**:这一版相当于在 test 上开发一个新项目,所有功能都合 test、只在 test 测。
+- **`main` 本身也是内测版**,不是面向大众的正式生产。
+- 最终上线**可能就是 `test` 直接合 `main`** —— 顺手一步,**不是"大发布"、不需要专门协调**。
+- → 现在**只管在 test 测好**就行。
 
 ### 7.6 route B 死代码清扫(等 route B 真下线一锅端)
 - `context_memory_selection.py` / `context_memories` 字段 / readside `ambient` 参数 / `coerce_runtime_action` / `hosted/context.py` / `hosted/turn.py` / model_api running-capture / route A/B 等价逻辑 / onboarding_validate model_api 分支。
