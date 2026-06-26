@@ -92,7 +92,7 @@
 1. 选 bucket(这轮聊哪个话题)→ memory_search(bucket=该桶)看目录。
 2. 看 summary/threads 挑 1-3 张 → memory_fetch 取正文。
 3. 想搞清来龙去脉 → follow_thread(某thread)跨桶串。
-4. 没命中别编。会话开始已带几条底色(最近+高importance)。
+4. 没命中别编(不要瞎造);闲聊不查。
 ```
 
 ---
@@ -122,7 +122,7 @@
 ## 9. 待 Seven 确认(只剩 2 个)
 1. **bucket 平铺 vs 层级**?baseline 写了"三层"又写"平铺/几十个"——我理解"三层"指**整体架构三层**(身份/索引/内容),**bucket 本身平铺**。建议平铺(§7)。**确认?**
 2. ~~pulse 进不进检索排序~~ **已定(Seven)**:pulse = AI 自己被触动多大,**不进排序**,只影响表达色彩。(气氛灯已废,见 §4。)
-> 其余已对齐:importance/pulse 拆、supersede soft、底色=最近+高importance、bucket 单选 + thread 多选 + 写时复用现有词表、limit 可配。
+> 其余已对齐:importance/pulse 拆、supersede soft、纯 agent-first 读(无 ambient/底色)、bucket 单选 + thread 多选 + 写时复用现有词表、limit 可配。
 
 ---
 

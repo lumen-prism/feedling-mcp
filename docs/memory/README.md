@@ -11,7 +11,7 @@
 3. **[读写合同 Read/Write Contract](IO-memory-read-write-contract.md)** — 读写不变量(已同步 v1:bucket/thread/importance/pulse/supersede)。
 4. **[给 zhihao 交付(工具+调用流程)](IO-memory-v1-给zhihao交付-工具与调用流程.md)** — 工具契约 + 回合读写流程 + 提示词 + adapter + 能力/编排边界。
 
-> 待对接:鉴权 token 边界(hx×zhihao);Seven 拍提示词 + bucket 平铺/pulse 排序。
+> 待对接:鉴权 token 边界(hx×zhihao);Seven 拍提示词 + bucket 平铺待确认。(pulse 已定:只影响表达色彩,**不进检索排序**。)
 > ~~`IO-memory-子系统-spec与plan-定稿v1.md`~~(route A/MCP 时代)、~~`IO-memory-v1极简重做`~~、~~`结构方案-给seven确认`~~、~~`v1实施方案-给codex-纯净分支`~~ 均**被上面 4 份取代**,仅备查。下面是历史脉络。
 
 ## 🧭 理清现状(乱了看这个)

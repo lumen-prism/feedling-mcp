@@ -15,7 +15,7 @@
 |---|---|
 | 写:capture→coerce→v1 卡(add/supersede/delete)| **读接进 loop**:**纯 agent-first** index/fetch;把老的 `backend/context_memory_selection.py` 自动注入**删掉**(⚠️ 不是替成 ambient——见下)|
 | `prompts_v1` 写入指引 + bucket/thread 词表注入(`existing_memory_terms`)| **挂 route A 同份合同**:consumer 不硬塞 prompt(有意,防污染用户输入),route A 读写规则由你 runtime/tool/skill 挂载 |
-| 端点 index/fetch/actions/**buckets/threads** 全在,支持 bucket/thread/ambient 参数 | runtime token→用户 的 tool gateway 鉴权翻译(走 A) |
+| 端点 index/fetch/actions/**buckets/threads** 全在,支持 bucket/thread filter(~~ambient 参数~~ legacy/dead,**勿接**)| runtime token→用户 的 tool gateway 鉴权翻译(走 A) |
 
 **一句话:写 + 工具 + 端点 = 已 live;读接进 loop + 替老注入 = 你的活。合并 ≠ 线上读自动变 v1。**
 
@@ -81,14 +81,14 @@ feedling_identity_get()                                    # 包 /v1/identity/ge
 |---|---|---|
 | `feedling_memory_search` | `POST /v1/memory/index` | 后端已有旧 readside;v1 需改成 bucket/thread/content schema |
 | `feedling_memory_fetch` | `POST /v1/memory/fetch` | 后端已有旧 fetch;v1 需返回 `content`,并处理 `last_referenced_at` |
-| ~~`feedling_memory_recall`~~ | ~~`/v1/memory/recall`~~ | **v1 不做**(读=agent search/fetch + 气氛灯 push;recall 以后或作省 token 捷径,非 v1)|
+| ~~`feedling_memory_recall`~~ | ~~`/v1/memory/recall`~~ | **v1 不做**(读=纯 agent search/fetch;recall 以后或作省 token 捷径,非 v1)|
 | `feedling_memory_write` | `POST /v1/memory/actions` | 后端已有 action executor;v1 需收敛到 add/supersede/delete |
 | `feedling_memory_buckets` | `GET /v1/memory/buckets` | v1 需新增,从现有卡聚合 |
 | `feedling_memory_threads` | `GET /v1/memory/threads` | v1 需新增,从现有卡聚合 |
 | `feedling_identity_get` | `GET /v1/identity/get` | 已有;runtime 每轮常驻 push |
 
 **现状核对(2026-06-25 已合 test)**:
-- `feedling-mcp` 现有 `/v1/memory/index`、`/fetch`、`/actions`、**`/buckets`、`/threads`**(均 v1;index 支持 `bucket`/`thread`/`ambient` 参数;fetch 回写 `last_referenced_at`)。
+- `feedling-mcp` 现有 `/v1/memory/index`、`/fetch`、`/actions`、**`/buckets`、`/threads`**(均 v1;index 支持 `bucket`/`thread` filter,`ambient` 参数 legacy/dead **勿接**;fetch 回写 `last_referenced_at`)。
 - `io-onboarding/skill.md` **仍是旧工具名**(`feedling_memory_add_moment/list/get/verify/retype`)→ **待更新成 v1 协议(hx/zhihao)**,否则 route A 用户写入质量跟不上 route B。
 - `backend/agent_runtime/` / 统一 tool gateway 仍由你 runtime 侧落地;**backend HTTP 能力已 v1-ready**,直接包成 `feedling_memory_*` 即可。
 
@@ -98,16 +98,14 @@ feedling_identity_get()                                    # 包 /v1/identity/ge
 
 > ⚠️ **最终结论(覆盖下面 preflight / §2.1)**:我们默认 agent 会 call tool,所以**读 = agent-first,该查 agent 自己调,闲聊不调**;**删掉每轮 preflight、should_read gate、recall 兜底、JSON 声明**(那些是给"不会调工具的 agent"兜底的,而不会调工具的就不算 agent)。下面的 preflight/§2.1 内容**已废弃,仅备查**。
 
-**读(回合中)= agent-first**:
+**读(回合中)= 纯 agent-first**:
 ```
 1. identity 常驻 push（feedling_identity_get,runtime 每轮带）
-2. (可选)气氛灯 ambient:runtime 带几条 最近+高 importance 的关系底色
-   —— 这是"推"不是"查",便宜、保持人设连续;需 hx 提供"按 importance 取 top-N(无 query)"能力
-3. agent 觉得长期记忆相关 → 自己调:
+2. agent 觉得长期记忆相关 → 自己调:
    feedling_memory_search(query?/bucket?/thread?) → 看目录 → 挑 → feedling_memory_fetch(ids) → 用
    → follow_thread(X) = feedling_memory_search(thread=X) 跨桶串
-4. 闲聊就不调(agent 自己判断);没命中别编
-不做:每轮强制 preflight / should_read / recall 兜底 / JSON 声明
+3. 闲聊就不调(agent 自己判断);没命中别编
+不做:每轮强制 preflight / should_read / recall 兜底 / JSON 声明 / 气氛灯 ambient 底色注入
 ```
 
 ---
@@ -128,7 +126,7 @@ feedling_identity_get()                                    # 包 /v1/identity/ge
    · 总数封顶（可配,~3-5）,去重
 ```
 
-**读侧 memory preflight 地图(v1 默认)**:
+**读侧 memory preflight 地图(已废,备查)**:
 
 ```text
 用户发消息
@@ -283,7 +281,7 @@ agent 判断有值得记的 → feedling_memory_write(add/supersede/delete)
 1. 选 bucket/thread → feedling_memory_search 看目录。
 2. 看 summary/threads 挑 1-3 张 → feedling_memory_fetch 取正文。
 3. 搞清来龙去脉 → feedling_memory_search(thread=某thread)跨桶串。
-4. 没命中别编。会话开始已带几条底色(最近+高importance)。
+4. 没命中别编(不要瞎造);闲聊不查。
 ```
 
 ---
@@ -294,26 +292,28 @@ agent 判断有值得记的 → feedling_memory_write(add/supersede/delete)
 |---|---|
 | 后端 HTTP 能力(index/fetch/recall/actions/buckets/threads)、selector、排序、加密读侧 | **hx 提供(能力)** |
 | 把 HTTP 能力包成 `feedling_memory_*` tools(MCP 优先 / HTTP fallback)、runtime token 校验、tool allowlist | **zhihao runtime/tool gateway** |
-| **每轮要不要调 / 调几条 / 怎么塞进 prompt / build_companion_context / 底色注入 / 封顶** | **zhihao 编排** |
+| **每轮要不要调 / 调几条 / 怎么塞进 prompt / build_companion_context / 封顶** | **zhihao 编排** |
 | agent loop、driver、session、token、consumer、supervisor | **zhihao** |
 
 > 即:hx 给的是"记忆后端能力 + 一份 memory adapter + 工具契约";真正暴露给 Claude/Codex 的 `feedling_memory_*` tool gateway,以及"每轮怎么用",属于 zhihao 的 agent-runtime 编排。
 
 ---
 
-## 5. memory adapter(build_companion_context 零件)
+## 5. memory adapter(build_companion_context 零件)—— ⚠️ route B 弃用后基本 moot
 
-hx 会把现在 `hosted/context.py:_model_api_context_messages` 里的 **memory 部分抽成一个独立 adapter**:
+> ⚠️ **2026-06-26**:此 adapter 是 route B / hosted(`build_companion_context` / `hosted/context.py`)时代的"服务端取数零件"。**route B 弃用 + 读=纯 agent-first 后,服务端不再组装 memory 上下文**——读全靠 agent 主动调 `feedling_memory_search/fetch`,没有"server 每轮取一批塞进 prompt"这回事。本节仅备查;真要保留,返回里**去掉 ambient**(`{ ambient[], recalled[] }` → `{ selected[] }`)。
+
+hx 原计划把 `hosted/context.py:_model_api_context_messages` 里的 **memory 部分抽成独立 adapter**:
 ```
-build_memory_context(user, query, *, limits) → { ambient[], recalled[], ... }
+build_memory_context(user, query, *, limits) → { selected[], ... }   # 原 {ambient[],recalled[]};ambient 已废
 ```
-你在新 runtime 的 `build_companion_context` 里调它(和 identity/screen/perception 并列),**不用碰它内部**。
+原意:新 runtime 的 `build_companion_context` 里调它(和 identity/screen/perception 并列),不碰内部。**现在 route B 没了,这条路 moot。**
 
 这个 adapter 的定位:
 - 不是新一套 agent loop。
 - 不是替代 zhihao 的 `consumer`。
 - 是 `build_companion_context` 里 memory 这块的"取数零件"。
-- 底层可以走同一批 `feedling_memory_search/get/recall` 能力,保证 hosted API 用户和 VPS/resident 用户行为一致。
+- 如未来仍保留 adapter,底层也只能走 `feedling_memory_search/fetch`;不再用 recall/context_memories。
 
 ---
 

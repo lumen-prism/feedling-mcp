@@ -38,7 +38,7 @@
   - flag-on 时,`index` 默认不返回敏感卡;`fetch` 按 id 取正文时也会在 enclave 解密后过滤敏感卡,并返回 `blocked_sensitive_ids` 便于观测。
 - **R5 读 = 纯 agent-first**:默认 agent 会 call tool → 该查自己 `search→fetch`(query/bucket/thread),闲聊不查。identity 常驻 push。**无 ambient/气氛灯**(Seven, 2026-06-26 废:不做 runtime 每轮自动注入背景)、无 recall 兜底、无每轮 preflight、无 should_read、无 `context_memories` 自动注入。
 
-**两 route 的读分工(机制不同、行为一致,详见定稿 §3.2)**:route B 看得见 tool_calls → 条件式(没调才兜底);route A 看不见 → 无条件推小 baseline + agent 自查叠加。**一致 = "agent 挑不出来时都有兜底",不是"两条都 always 双推"。**
+> ~~两 route 的读分工(route B 条件式兜底 / route A 推小 baseline)~~ **已废(2026-06-26)**:route B 弃用 + 无 ambient/兜底,**读统一为纯 agent-first**(见 R5)。不再有"机制不同、行为一致"这套。
 
 ---
 
