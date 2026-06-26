@@ -2,8 +2,10 @@
 
 > 所有 memory 相关文档统一收在这里。状态约定:**定稿** = 唯一真相源;**当前** = 仍有效;**历史脉络** = 怎么走到今天(备查);**已被取代** = 内容已收进定稿,冲突以定稿为准;**archive/** = 废弃。
 
+> ⚠️ **全局废止(Seven, 2026-06-26):ambient / 气氛灯 取消。** 读 = **纯 agent-first**(agent 主动 `search`/`fetch`),**没有 runtime 每轮自动注入背景这回事**。`context_memories`(后端 server 自动注入)同属此类 → 归后端清理(P6)。下面任何文档里残留的 "ambient / 气氛灯 / 每轮自动带底色 / context_memories" **一律以本条为准(失效)**。结构定稿 §4 已更新;skill 已删干净。
+
 ## ⭐⭐⭐ v1 当前真相(Codex review 就看这 4 份,2026-06-25)
-1. **[v1 结构定稿(bucket+thread)](IO-memory-v1结构定稿-bucket-thread.md)** — 结构唯一真相:事件即记忆/bucket 单选+thread 多选/importance·pulse/supersede soft/decay 派生/agent-first 读+气氛灯。
+1. **[v1 结构定稿(bucket+thread)](IO-memory-v1结构定稿-bucket-thread.md)** — 结构唯一真相:事件即记忆/bucket 单选+thread 多选/importance·pulse/supersede soft/decay 派生/**纯 agent-first 读(无 ambient)**。
 2. **[v1 实施计划(基于 Codex 通读 test)](IO-memory-v1实施计划-test基线.md)** — 后端怎么建:基线 current test、干净 v1、影响范围、耦合护栏、迁移(adapter+回填口)、提示词初版、P1-P7。
 2b. **[v1 实现 Spec(给 Codex 改代码)](IO-memory-v1-实现spec-给codex.md)** — ⭐**精确到文件/函数的改动**(P1-P7),Codex 照此写代码、CC review。
 3. **[读写合同 Read/Write Contract](IO-memory-read-write-contract.md)** — 读写不变量(已同步 v1:bucket/thread/importance/pulse/supersede)。

@@ -30,7 +30,7 @@
 | `threads` | 索引 | **线索(多选,string[])**:`工作压力`/`蛋子`/`冷战`…。**既是检索抓手,也是 follow_thread 横穿桶的连线**(thread ≈ tag,多选) |
 | `summary` | 索引 | 一句话:这卡是啥(agent 一眼判断要不要进去读) |
 | `importance` | 视标 | **0–1:看不看**(对长期理解用户多重要)。**写时模型打,客观、不随时间变** |
-| `pulse` | 视标 | **0–1:这件事在 AI(陪伴者)自己心里激起多大波动**(不是用户多激动,是 TA 多被触动;Seven 定稿口径)。**只影响表达色彩 + 气氛灯挑选,不进检索排序** |
+| `pulse` | 视标 | **0–1:这件事在 AI(陪伴者)自己心里激起多大波动**(不是用户多激动,是 TA 多被触动;Seven 定稿口径)。**只影响表达色彩,不进检索排序**(~~气氛灯挑选~~ 已废)|
 | `status` | 视标 | `active`/`superseded`/`archived`。非 active 默认不返回 |
 | `source` | 视标 | `chat`/`screen`(grounded 出处;推理/猜测不在这,进推理层) |
 | `occurred_at` | 视标 | 发生/创建时间 |
@@ -53,11 +53,10 @@
 
 ## 4. 检索(agent 驱动,不硬截)
 
-- **identity** = 每轮 push(常驻)。
-- **底色 ambient(气氛灯)= runtime push,不是 agent 查**:每轮带几条 **最近 + 高 importance**(任意 bucket;不给关系桶开小灶,"最近的也最贴近最近关系")。
-  - **能力(hx 提供)**:`index` / `search()` **不传 query、按 importance×recency 排序、取 top-N**——runtime 每轮调它推底色。便宜、可缓存、保持人设连续(闲聊也带)。
+- **identity** = 每轮 push(常驻、用户控制)。
+- **读 = 纯 agent-first,无 runtime 自动注入背景。** ~~ambient / 气氛灯~~ **已废(Seven, 2026-06-26)**:不做"runtime 每轮自动带几条底色"。陪伴感 / 关系连续性靠 agent 主动召回,不靠自动背景层。(`context_memories` 同属此类——后端 server 自动注入,归后端清理。)
 - **agent 自己查(agent-first)**:agent 选 `bucket` / `thread` 去 `index` → 看目录(summary/threads/视标,**不含 content**)→ 挑 1-3 张 `fetch` 取正文 → 需要时 `follow_thread` 跨桶串。**该查 agent 自己调,闲聊不调。**
-- **index 默认全返回(无 limit 旋钮)**:目录轻(无 content),agent 自己扫挑;**大了靠 bucket/thread 收范围,不盲截**(盲截会漏卡)。只留一个不可见安全上限防极端 dump。气氛灯 ambient 的 top-N 是它自己的,≠ index。
+- **index 默认全返回(无 limit 旋钮)**:目录轻(无 content),agent 自己扫挑;**大了靠 bucket/thread 收范围,不盲截**(盲截会漏卡)。只留一个不可见安全上限防极端 dump。
 - **去重**:一张卡可能被多条路命中(桶 / thread / 最近),最后去重。
 - **不做 recall 兜底 / preflight / should_read**:我们默认 agent 会 call tool,该查自己 `search→fetch`;recall 以后或作"省 token 捷径",非兜底。
 
@@ -122,7 +121,7 @@
 
 ## 9. 待 Seven 确认(只剩 2 个)
 1. **bucket 平铺 vs 层级**?baseline 写了"三层"又写"平铺/几十个"——我理解"三层"指**整体架构三层**(身份/索引/内容),**bucket 本身平铺**。建议平铺(§7)。**确认?**
-2. ~~pulse 进不进检索排序~~ **已定(Seven)**:pulse = AI 自己被触动多大,**不进排序**,只影响表达色彩 + 气氛灯挑选。
+2. ~~pulse 进不进检索排序~~ **已定(Seven)**:pulse = AI 自己被触动多大,**不进排序**,只影响表达色彩。(气氛灯已废,见 §4。)
 > 其余已对齐:importance/pulse 拆、supersede soft、底色=最近+高importance、bucket 单选 + thread 多选 + 写时复用现有词表、limit 可配。
 
 ---

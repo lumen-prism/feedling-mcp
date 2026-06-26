@@ -36,7 +36,7 @@
 - **R4 敏感 gating(v1 默认关闭)**:本 app v1 决定默认把敏感记忆当普通记忆处理,即 `MEMORY_SENSITIVE_GATING_ENABLED` 默认 off。off 时,`include_sensitive` 不影响 readside,index/fetch/selector 都不因 `is_sensitive` 过滤。
   - flag-on 时恢复从严门禁:`include_sensitive` 默认 false;agent 不得为"多补点上下文"主动打开 sensitive;只有用户**显式请求**、且请求本身就关于该敏感主题时,才允许取敏感卡。
   - flag-on 时,`index` 默认不返回敏感卡;`fetch` 按 id 取正文时也会在 enclave 解密后过滤敏感卡,并返回 `blocked_sensitive_ids` 便于观测。
-- **R5 读 = agent-first,不做 recall/preflight**:默认 agent 会 call tool → 该查自己 `search→fetch`(query/bucket/thread),闲聊不查。**气氛灯 ambient = runtime push**(非 agent 查):`importance×pulse×recency` 无 query 取 top-N,会话开始带几条关系底色。identity 也常驻 push。(无 recall 兜底、无每轮 preflight、无 should_read。)
+- **R5 读 = 纯 agent-first**:默认 agent 会 call tool → 该查自己 `search→fetch`(query/bucket/thread),闲聊不查。identity 常驻 push。**无 ambient/气氛灯**(Seven, 2026-06-26 废:不做 runtime 每轮自动注入背景)、无 recall 兜底、无每轮 preflight、无 should_read、无 `context_memories` 自动注入。
 
 **两 route 的读分工(机制不同、行为一致,详见定稿 §3.2)**:route B 看得见 tool_calls → 条件式(没调才兜底);route A 看不见 → 无条件推小 baseline + agent 自查叠加。**一致 = "agent 挑不出来时都有兜底",不是"两条都 always 双推"。**
 
@@ -94,7 +94,7 @@ memory.retype         → 400 unsupported
 | **supersede soft**:旧卡 `status=superseded`+链新卡、**原子、永不硬删**;新卡继承 bucket/threads | `memory/actions.py:_memory_supersede_action`;`tests/test_memory_m2_write_loop.py` |
 | readside:**支持 `bucket` / `thread` filter**;**`index` 只返回摘要(不含 content),`fetch` 才返回 content**;**`limit` 可配(默认放宽 / 0=全),不 hardcode 50**;`status≠active` 不返回 | `memory_index_core` / `memory_fetch_core` |
 | **`follow_thread` = `index(thread=X)` 过滤**(跨 bucket),非独立端点 | `memory_index_core` |
-| 读 = `index`(目录,无 content)→ agent 挑 → `fetch`(content);**无 recall/preflight**;气氛灯=`index` 无 query 按 `importance×pulse×recency` 取 top-N(runtime push)| `memory_index_core`/`memory_fetch_core`;`memory_index_selector` |
+| 读 = `index`(目录,无 content)→ agent 挑 → `fetch`(content);**纯 agent-first,无 ambient/气氛灯/recall/preflight/context_memories 自动注入** | `memory_index_core`/`memory_fetch_core`;`memory_index_selector` |
 | 敏感 gating:`MEMORY_SENSITIVE_GATING_ENABLED` 默认 off | `memory_readside_config`;`tests/test_memory_readside*.py` |
 | **resolve-before-create**:`GET /v1/memory/buckets\|threads`(或聚合现有卡)给写入提示注入现有词表 | 新增小能力 |
 

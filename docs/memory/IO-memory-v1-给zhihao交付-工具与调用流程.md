@@ -7,11 +7,13 @@
 ---
 
 ## 现状(2026-06-25 已合 test)—— 先看这个
+> ⚠️ **更新(2026-06-26):ambient / 气氛灯 + `context_memories` 全废(Seven 否)。** 读 = **纯 agent-first**(agent 主动 search/fetch),**没有 runtime 每轮自动注入背景**。本文下面所有 "气氛灯 / ambient / 每轮带底色 / recall 兜底" 一律失效。后端 `context_memory_selection` / `context_memories` 是**删**,不是替成 ambient。
+
 后端 v1 **已实现并合并 test**(Codex 实现 / CC review / DB 测试绿)。所以本文里"v1 需改/需新增"的措辞**大多已完成**;你看的是**消费侧契约**,不是待建清单。真实状态:
 
 | 已 live(route B) | 你(zhihao)要接的 |
 |---|---|
-| 写:capture→coerce→v1 卡(add/supersede/delete)| **读接进 loop**:agent-first index/fetch + 气氛灯 ambient,**替掉**老的 `backend/context_memory_selection.py` 自动注入(**目前线上读还是老的**)|
+| 写:capture→coerce→v1 卡(add/supersede/delete)| **读接进 loop**:**纯 agent-first** index/fetch;把老的 `backend/context_memory_selection.py` 自动注入**删掉**(⚠️ 不是替成 ambient——见下)|
 | `prompts_v1` 写入指引 + bucket/thread 词表注入(`existing_memory_terms`)| **挂 route A 同份合同**:consumer 不硬塞 prompt(有意,防污染用户输入),route A 读写规则由你 runtime/tool/skill 挂载 |
 | 端点 index/fetch/actions/**buckets/threads** 全在,支持 bucket/thread/ambient 参数 | runtime token→用户 的 tool gateway 鉴权翻译(走 A) |
 
