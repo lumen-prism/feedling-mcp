@@ -69,3 +69,51 @@
 2. **skill-memory-v1 是否真覆盖了 memory-m-http-skills 的两条 route-A HTTP read/write 规则?** 若没全覆盖,把差的那点摘进 skill-memory-v1 再删。
 
 > 这两条是仅有的"可能丢东西"的风险点,其余收敛是纯整理。
+
+---
+
+## 6. Codex review(2026-06-26)+ 共识修订
+
+Codex 审完:方向对,但**不能原样绿灯**。4 点(CC 已认 —— 其中 2 点纠正了我的判断):
+
+1. **🔴 recall 兜底口径冲突(必须先拍)**:文档(`read-write-contract.md:39`)= 纯 agent-first、**无 recall 兜底**;但 memory-m 的 `tools/chat_resident_consumer.py:254` 默认 `FEEDLING_ROUTE_A_MEMORY_RECALL=True`(agent 回复前自动打 `/v1/memory/recall`)。文档说"让 agent 自己查",代码说"agent 没查我也帮它查"。→ **决定:保留 `/v1/memory/recall` 端点能力,但 consumer 自动注入默认 OFF**(作 debug / 省 token / 弱模型备选,非 v1 默认路径)。与既定"纯 agent-first"口径一致。
+
+2. **丢 `433d9af` 成立,且不要摘它的 `action_schema.py`/`context_layout.py`**:它们读旧字段(`her_quote`)、和 route B/hosted 旧逻辑耦合;`433d9af` 是旧方案脚手架,`b078d7f` 是更集中的后端能力。以后真要共享 action normalization,**按 v1 字段重抽**,别摘旧的。
+
+3. **`memory-m-http-skills` 不能直接删** —— 有几条 `skill-memory-v1` 没覆盖的 VPS 接线,**先摘进 skill-memory-v1**(顺带修我 v1 skill 里的 stale bug):
+   - decrypt source 是 `FEEDLING_ENCLAVE_URL`(旧 MCP decrypt 已移除)—— **但 v1 skill-resident 还写 `FEEDLING_MCP_URL/MCP_KEY`(stale,我的 bug)**。
+   - resident consumer 用 feedling-mcp 的 **`origin/test`,不是 `origin/main`** —— **v1 skill-resident 还写 `origin/main`(stale,我的 bug)**。
+   - 注册 `tools/io_cli.py perception` 为 runtime native tool 的说明。
+   - memory HTTP tools 的 readiness / smoke test。
+   - `agent_name` 与 runtime label 分离(别为改卡名切 runtime 或改 runtime 身份文件)。
+
+4. **rebase 会冲突(我之前错说"应无冲突")**:高危 `tools/chat_resident_consumer.py`;中危 `backend/memory/routes.py`、`backend/memory_readside_core.py`、`backend/enclave_app.py`、`tests/test_memory_action_conformance.py`;低-中 `backend/hosted_runtime.py`。因 memory-m 切自旧 test `574b1ed`,test 已到 `8b7c39d`(中间进了 schema/A'/identity-init/perception)。
+
+### 共识收敛顺序(修订,以此为准)
+1. **拍 recall 默认 OFF**(纯 agent-first;端点保留)。
+2. **rebase `memory-m` → `origin/test@8b7c39d`**,重点解 consumer / memory routes 冲突;落地时把 recall 自动注入默认关掉。Codex review 代码 → 合 test。
+3. **丢 `433d9af`**,留 hosted-memory-tools 的 docs。
+4. **把 `memory-m-http-skills` 的 5 条 VPS 接线摘进 `skill-memory-v1`**(顺便修 stale 的 `MCP_URL→ENCLAVE_URL`、`origin/main→origin/test`)。
+5. **删 `memory-m-http-skills`,合 `skill-memory-v1` → io-onboarding main**。
+
+> 目标(hx):保证 test 拿到全部 v1 功能、别遗漏;稳定后这些分支删掉都行。
+
+---
+
+## 7. 更新(2026-06-26,hx 决定 + 实测)
+
+- **recall 直接丢**(hx:"recall 丢了都没事,反正不用了")。§6 #1 的"保留端点、默认关"→ 简化为**不要 recall**(test 本来就没有,不动)。
+- **`memory-m` 这条分支基本可弃**:recall 丢了;剩的只有**敏感 fetch gate**(`40c3659`,flag 默认关 = 休眠,不卡测试)→ 以后真开 flag 前单独 cherry-pick 即可。**那个有冲突的大 rebase 不用做了。**
+- **test 后端 v1 已实测 ✅**:对当前 test(`a078fe8`)跑 v1 相关套件 = **100 passed / 4 skipped / 0 failed**(identity init / onboarding import / readside / write / bootstrap / conformance / relationship days)。identity-init 已部署 test CVM(`deploy bump :8b7c39d`)。
+- 旁:test 上又进了**consumer 自动更新**(PR#15,非 memory v1,不影响 v1 面)。
+
+## 8. 正式版本 onboarding skill TODO(hx:skill 可改,这些留作正式版前置)
+
+`feat/skill-memory-v1` 现在**可测**(測法 A:把 agent 指向该分支 raw URL)。但**合 io-onboarding main 做正式版前**要补(Codex 指出):
+1. 修 stale:`FEEDLING_MCP_URL/MCP_KEY` → `FEEDLING_ENCLAVE_URL`(decrypt source;旧 MCP decrypt 已移除)。
+2. 修 stale:resident consumer 拉 feedling-mcp 的 **`origin/test`**,不是 `origin/main`。
+3. 从 `memory-m-http-skills` 摘:把 `tools/io_cli.py perception` 注册为 runtime native tool 的说明。
+4. memory HTTP tools 的 readiness / smoke 说明。
+5. `agent_name` vs runtime label 分离(别为改卡名切 runtime / 改 runtime 身份文件)。
+6. 补完 → 删 `memory-m-http-skills` → 合 `skill-memory-v1` 到 io-onboarding main。
+> 测试阶段(測法 A)可先不补;**这是正式版上 main 的前置清单**。
