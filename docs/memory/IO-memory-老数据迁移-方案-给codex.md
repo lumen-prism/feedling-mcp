@@ -57,7 +57,9 @@
 2. **写回**:原地 re-encrypt(建议,不产重复)还是 supersede(留审计、但翻倍)?
 3. **API 迁移**:复用 history_import 管道(source 改成"已解密的老卡"而非上传文本)够不够,还是单开 `/v1/memory/migrate` job?
 4. **VPS**:迁移作 skill 的独立 step,还是并进现有 onboarding pass?顺序(迁移 vs identity 谁先)?
-5. **降级 vs 强迁**:同意"拒绝就留降级、不强制"?还是要个**无 LLM 的结构性兜底**(summary←title、content←description、bucket←type 默认)作为即时楼面,LLM 派生作增强?
+5. **降级 vs 强迁**:同意"拒绝就留降级、不强制"?(降级 = **现有读时 fallback**:"未归类" + summary←title,**只是"还没迁/拒绝"的状态,不是迁移产物**。)
+   - ⚠️ **迁移一律走 LLM,不做无 LLM 的结构性迁移**(hx 拍定):v1 的价值是语义——bucket 归类、threads 线索、尤其 content 三段里的**「使用提示」(怎么用这条记忆的判断)**,纯字段映射生不出来,只会产空壳。
+   - 两条路天然都有 LLM:**API 形式有用户的 model_api key,VPS 形式 agent 本身就是 LLM** → 迁移上下文一定有 LLM 可用,不存在"没模型"的死角。
 6. **成本/批量**:一次性批量(建议)还是 lazy 按读迁?批量条数上限 / 进度。
 
 ---
@@ -67,4 +69,5 @@
 - API:服务端 job 复用 history_import 管道,弹框触发,用用户 model_api。
 - VPS:skill 加「迁移旧记忆」step,agent 驱动。
 - 原地 re-encrypt、幂等、resolve-before-create。
-- 拒绝 → 降级兼容(已工作),不强迁;**结构性兜底可选**(让"未归类"至少变成 summary=title、content=description,比纯空好)。
+- **迁移一律 LLM 派生**(语义归类/线索/使用提示,纯映射做不到)。API 用用户 model_api、VPS 用 agent —— 两边都有 LLM。
+- 拒绝 → 留现有降级读("未归类",非迁移产物),不强迁。
