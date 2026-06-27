@@ -51,12 +51,27 @@
 - 之后 Dream 持续 refine(已有 lane,但见 §8.3 tick 闸门)。
 - **范围仅老 host 用户**;新用户走 §1 genesis。
 
-**已定(不再待拍)**:**cutover-batch(30-40 一次性 job)+ lazy async enqueue 兜底,禁止 spawn 热路径同步跑 LLM。**
+### 2.1 实现 spec(Codex 设计 review 收敛,CC 已核实,锁定)
 
-**实现要点**:
-- §7.B 喂 identity 的输入映射:`custom_persona_prompt`→"你是谁"主干、`tone_style`→语气、`self_introduction`→补充;**逐字 exemplars 补不了**(原始历史没留),只出 baseline,Dream 后续养。
-- "有信号才补、全空留空"的判断阈值。
-- ⚠️ 前提:**先解 §8.5 P0(persona decrypt 拿不到 token)**,否则 batch/lazy 写好了 spawn 仍解不出。
+**A. 写 blob —— 走 genesis 正规生产线,source 归 `ai_persona` 家族**
+- ⚠️ 纠正:**只有 `source_family == "ai_persona"` 走 persona_build**(`worker.py:429`);`user_profile` 走 strip 分支不产 persona(`worker.py:123`)。所以不能"喂任意非-history"。
+- 做法:**新增 source_kind `identity_persona_backfill`(归进 `AI_PERSONA_SOURCE_KINDS` `worker.py:27`)**;把 `tone_style/custom_persona_prompt/self_introduction` 拼成 persona material → 作为 **1 个加密 chunk** 创建 genesis import job → 现有 worker claim → decrypt → persona_build → apply outputs → 写 `genesis_persona` blob。
+- **不改 worker source 分支硬塞,不绕过 job 表直接写 blob。** 原料是"老用户 persona 素材",不是上传历史。
+
+**B. 触发 —— 走 genesis job lane(`genesis_import_jobs`),不走 `capture_jobs`**
+- ⚠️ 纠正:worker claim 的是 `genesis_claim_uploaded_jobs`(`db.py` genesis_import_jobs status=uploaded);capture_jobs 是 memory/dream 的 lane。**backfill 不走 capture_jobs。**
+- batch:30-40 老用户各创建 `genesis_import_jobs + 1 encrypted chunk + finalize`。
+- lazy:supervisor 发现缺 `genesis_persona` 且 identity 有 persona 信号 → 创建同款 genesis job + 本轮 baseline(不在 spawn 同步跑 LLM)。
+- **幂等**:稳定 key `persona_backfill:v1:<user_id>:<material_hash>`,避免每 tick 重复入队。
+
+**C. pickup —— `_spawn_identity` 加 persona 指纹(用 `sha256` digest,不用 body_ct hash)**
+- `genesis_persona` blob 已存明文 digest(`persona_sha256`,`service.py`)→ 用它做 `persona_version`(不泄露内容、比 body_ct hash 准)。
+- 在 `_effective_roster`(`supervisor.py:494`)统一 enrich 点 `db.get_blob(user_id,"genesis_persona")` → 取 sha256 → 塞 `entry["persona_version"]` → `_spawn_identity` 加它。
+- 写 blob 后,下个 tick `_spawn_identity` 变 → **自然 respawn 重 seed prompt** → 下轮吃 voice。
+- ❌ 不直接 kill consumer(太硬、打断会话);❌ 不原地改 prompt 文件(运行中 claude/codex 不一定重读 system prompt)。
+
+**input 映射**:`custom_persona_prompt`→"你是谁"主干、`tone_style`→语气、`self_introduction`→补充;逐字 exemplars 补不了,只出 baseline,Dream 后养。identity 信号全空 → 不补,留空。
+**前提**:§8.5 P0 已解(✅ `c56e3c9`)。
 
 ---
 
