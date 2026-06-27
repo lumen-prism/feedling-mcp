@@ -183,7 +183,9 @@
 
 - `e9e4701` ④**B-3 lazy 触发(完成 ④)**:`sup.tick` 后对 `persona_version==""` 用户 POST endpoint;单独 mint 短 TTL `["genesis","envelope_decrypt"]` token(不污染 spawn scopes)+ cap(`FEEDLING_PERSONA_BACKFILL_MAX_PER_TICK=2`)+ cooldown(`..._COOLDOWN_SEC=3600`)+ best-effort(不阻塞 tick);flag `FEEDLING_PERSONA_BACKFILL_LAZY` 默认关。
 
-**✅ ④ voice backfill 全部完成(11 commit)。**
+- `c375b88` 修(Codex review):无 token 时 `_identity_plain_for_action` 走旧两参调用(CI 转绿,test_identity_actions 12 passed)+ B-3 timeout 15→5s + 首触发 `uid in dict`。
+
+**✅ ④ voice backfill 收口完成(12 commit)。Codex 复验绿:相关 suite 139 passed。可进合并前常规 CI/review。**
 
 **剩余(非 ④)**:
 - ④B-2 batch = ops 对 30-40 调 endpoint,**无新代码**。
