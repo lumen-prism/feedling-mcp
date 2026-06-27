@@ -62,7 +62,11 @@
 - ⚠️ 纠正:worker claim 的是 `genesis_claim_uploaded_jobs`(`db.py` genesis_import_jobs status=uploaded);capture_jobs 是 memory/dream 的 lane。**backfill 不走 capture_jobs。**
 - batch:30-40 老用户各创建 `genesis_import_jobs + 1 encrypted chunk + finalize`。
 - lazy:supervisor 发现缺 `genesis_persona` 且 identity 有 persona 信号 → 创建同款 genesis job + 本轮 baseline(不在 spawn 同步跑 LLM)。
-- **幂等**:稳定 key `persona_backfill:v1:<user_id>:<material_hash>`,避免每 tick 重复入队。
+- **幂等(三态区分,Codex 提醒,必做)**:lazy 每 tick 都可能发现"缺 blob + 有素材",必须分三态防重复尝试:
+  1. **素材为空**(`has_persona_signal`=False)→ 不入队,留空交 Dream;
+  2. **正在 backfill / 已 backfill**(已有 genesis job 带稳定 key `persona_backfill:v1:<user_id>:<material_hash>`,uploaded/processing/done)→ 跳过;
+  3. **缺 blob + 有素材 + 无 job** → 才入队。
+  用 **material_hash + job 查询**兜住(已实现纯件:`genesis/persona_backfill.py`)。
 
 **C. pickup —— `_spawn_identity` 加 persona 指纹(用 `sha256` digest,不用 body_ct hash)**
 - `genesis_persona` blob 已存明文 digest(`persona_sha256`,`service.py`)→ 用它做 `persona_version`(不泄露内容、比 body_ct hash 准)。
