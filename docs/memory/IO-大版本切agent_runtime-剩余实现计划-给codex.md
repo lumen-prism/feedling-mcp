@@ -165,3 +165,24 @@
 `① genesis 上传 E2E → ② worker preflight → ③ **persona decrypt/token preflight(P0)** → ④ batch+lazy voice → ⑤ **photo/tool 权限对齐** → ⑥ image/gateway legacy 策略 → ⑦ **Dream tick 验证** → ⑧ 最后翻 flags`
 
 **Codex 拍板**:image/gateway legacy 保留 = 认可;async backfill "本轮 baseline、下轮 voice" = 认可**但前提是先解 P0**(否则 backfill 写好 spawn 仍解不出)。**这版可进入实现,§8.5 三闸门补齐后开工。**
+
+---
+
+## 9. 实现进度(0627 checkpoint)— branch `feat/agent-runtime-cutover-gates`(基于 origin/test)
+
+**已完成(10 commit,全 Codex review+测过)**:
+- `fb11696` ⑤ photo 权限(`_IO_CLI_VERBS` 加 photo-*)
+- `c56e3c9` ③ **P0**:HOST_ALL 下 persona decrypt(enclave 收 runtime token + entry 携 token + timing)
+- `5bf5c85` ④A 基础:`companion_persona_backfill` source_kind + 纯件 `genesis/persona_backfill.py`(assemble/hash/signal)
+- `e9f6cda` ④C pickup:`persona_version`(blob sha256)→ `_spawn_identity` → 自然 respawn 重 seed
+- `dda83f0` 修:`_persona_version` last-good cache(DB 抖动不误 respawn)
+- `e120457` ④A-3:`run_persona_backfill`(assemble→幂等→加密 chunk→genesis import job→worker)
+- `3e01f13` 修:幂等改 `source_kind+material_sha256`(backfill_key 被 `_safe_job_metadata` 过滤)+ backfill 不进 blocking spawn gate(`write_genesis_state` 加 source_kind,gate 排除)
+- `d470442` ④B-1:`POST /v1/genesis/persona_backfill` endpoint + `_enclave_get_json_for_gate`/`_identity_plain_for_action` token-aware
+- `5878afd` 修:复位 `apply_outputs` 成功 return(B-1 插入截断了它,CC 核出 Codex 误判为 cosmetic)
+
+**剩余**:
+- 🔨 **④B-3 lazy 触发(唯一剩的新代码,下一轮 fresh focus)**:supervisor tick 内对 `persona_version==""` 用户 POST endpoint。**终版 spec(Codex 拍)**:① supervisor **单独 mint 短 TTL `["genesis","envelope_decrypt"]` token**(不污染 spawn token scopes);② **守卫**(cooldown 防每 tick 重 POST);③ **限速/后台化**(每 tick 至多 1-2 个,别同步阻塞 tick);④ failed 可重试(run_persona_backfill 幂等兜)。
+- ④B-2 batch = ops 对 30-40 调 endpoint,**无新代码**。
+- ① iOS 上传改道 genesis(Swift);②/⑥/⑦/⑧ = 已有/策略/ops。
+- P2 单测(persona_backfill 纯件 + 幂等 + apply_outputs 成功路径 + persona_version respawn 条件)归测试步/Codex。
