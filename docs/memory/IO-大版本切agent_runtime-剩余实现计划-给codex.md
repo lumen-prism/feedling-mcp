@@ -44,12 +44,11 @@
 
 **问题**:老 host 用户(route-B 下被 `tone_style`/`custom_persona_prompt` 塑形)切 agent_runtime 后**没 `genesis_persona` blob** → voice 断、退通用,且那些字段(route-B 退役后没人读)变孤儿。
 
-**要做(lazy-on-spawn,复用 §7.B,不批不脚本)**:
-- spawn 时(`_genesis_persona_content` 附近)若 **blob 为空 且 identity 有 persona 信号**(`tone_style`/`custom_persona_prompt` 非空)→ 触发**一次** §7.B persona-build(LLM,用户 key,genesis/CVM 路,**喂 identity 而非历史**)→ 写 `genesis_persona` blob → spawn 读到。
-- **per-user 一次、快**(非批量,一个 LLM 调用)、**幂等**(写过不再触发)。
-- identity 信号**都空** → 不触发(留空,交 Dream 从 ongoing 聊天慢慢养)。
-- 之后 Dream 持续 refine(已有 lane)。
-- **范围仅老 host 用户**;新用户走 §1 genesis,不进此路。
+**要做(⚠️ 以 §8.2 为准 —— batch + async enqueue,不在 spawn 同步跑 LLM)**:
+- **30-40 个先 cutover-batch 一次**(一次性 job,复用 §7.B 喂 identity 非历史 → 写 blob);**lazy 兜底走 async enqueue**:spawn 发现缺 blob 只**入队 backfill job + 本轮 identity baseline 回答 + 下轮吃 voice**(**不在 spawn 热路径同步跑 LLM**)。
+- per-user 一次、幂等(写过不再触发);identity 信号**都空** → 不补,留空交 Dream。
+- 之后 Dream 持续 refine(已有 lane,但见 §8.3 tick 闸门)。
+- **范围仅老 host 用户**;新用户走 §1 genesis。
 
 **要 Codex 拍**:
 - 触发点放 `spawners` 还是 `supervisor`?lazy-on-spawn(首次延迟一次 §7.B)vs cutover 批一次 —— 倾向 lazy(自愈、不挑时机)。
@@ -125,3 +124,22 @@
 5. 最后才翻 `HOST_ALL / GENESIS_WORKER / Dream / session cap`。
 
 **一句话(Codex,采纳):能继续落,但按"补上线前闸门"落,不是直接翻 flag。最该先拆的是 genesis 上传合同 + worker preflight。**
+
+---
+
+## 8.5 Codex round-2 收敛(0627,CC 又独立核实,全为真,含纠 CC 一处错)
+
+**新增 3 个闸门(都实锤):**
+
+1. **🔴 P0 硬闸门 —— HOST_ALL 零 roster 下 persona 解不出来。** `_genesis_persona_content`(`spawners.py:231`)靠 **api_key** 走 enclave 解 `genesis_persona` blob,docstring 自己写着 **"token-only auth → tools-only"**;而 HOST_ALL 的 Stage-D entry **没 api_key**(`_resolve_discovered` `supervisor.py:314`,只有 runtime token)→ **全量托管下 voice blob 写了也解不出 → 退通用。** **修法**:让 persona decrypt 支持 **runtime token**,或 supervisor 在 spawn 前 mint token 解好/传好。**这是 voice cutover 的死结,必须先解,否则 §1/§2 都白做。**
+
+2. **P1 —— photo 工具 prompt 与 allowlist 不一致。** prompt(`agent_tools_prompt.md:20`)让 agent 用 `photo-recent/photo-read`,io_cli 也实现了(`io_cli.py:230`),但 `_IO_CLI_VERBS`(`spawners.py:43`)**没放 photo** → **Claude 被权限拦**(Codex 可能能跑)。**修法**:补 allowlist 或 prompt 删 photo,二选一对齐。
+
+3. **P1 —— Dream 不是翻 flag 就跑。** enqueue 在 `/v1/capture/tick`/`/v1/dream/tick`(`routes.py:173/189`),且有夜间窗口 + 最少新卡/新对话阈值(`dream_scheduler.py:48`)。**要确认线上谁定时打 tick、频率、失败日志** —— 不是开了就自动跑。
+
+**纠 CC 一处错(采纳)**:**session cap host 侧已经是 24**(`_HOST_SESSION_MAX_TURNS="24"` `spawners.py:56/282`),不是 40;只有 **VPS consumer 默认仍 40**(`chat_resident_consumer.py:263`)。→ host 这项**不是代码任务**,只需确认部署 env 不覆盖。
+
+**修订落地顺序(替代 §8.4):**
+`① genesis 上传 E2E → ② worker preflight → ③ **persona decrypt/token preflight(P0)** → ④ batch+lazy voice → ⑤ **photo/tool 权限对齐** → ⑥ image/gateway legacy 策略 → ⑦ **Dream tick 验证** → ⑧ 最后翻 flags`
+
+**Codex 拍板**:image/gateway legacy 保留 = 认可;async backfill "本轮 baseline、下轮 voice" = 认可**但前提是先解 P0**(否则 backfill 写好 spawn 仍解不出)。**这版可进入实现,§8.5 三闸门补齐后开工。**
