@@ -33,10 +33,11 @@
 2. **(后端)开 worker**:`FEEDLING_GENESIS_WORKER_ENABLED`;确认 finalize → worker pick up → 蒸馏 → 写 `genesis_persona` blob + identity 卡(7.C name/维度)+ memory facts。
 3. **(glue)** 确认蒸完 spawn 能读到 blob(`_genesis_persona_content`)。
 
-**要 Codex 拍**:
-- history_import **完全退役** vs 过渡并存?(新版本 host 走 genesis,老 route-B 退役)
-- iOS genesis 上传的加密(content envelope / enclave_pk_fpr)怎么和 CVM 解密对齐(`backend/genesis/service.py` chunk envelope meta)。
-- identity 现在两条产:老 history_import vs 新 genesis 7.C-write —— 切后只留 genesis?
+**已定**:
+- **新 iOS onboarding 只走 genesis**;`history_import` **只做旧路 / 回滚**,**不和 genesis 同时处理同一批上传**(一份上传只进一条路,别双写)。
+- 切后 identity 只由 genesis 7.C-write 产(新用户);老用户 identity 已存,不重产。
+
+**待对齐(技术,不阻塞决策)**:iOS genesis 上传的加密(content envelope / enclave_pk_fpr)怎么和 CVM 解密对齐(`backend/genesis/service.py` chunk envelope meta)—— §8.1 第 1 闸门 E2E 时定。
 
 ---
 
@@ -50,10 +51,12 @@
 - 之后 Dream 持续 refine(已有 lane,但见 §8.3 tick 闸门)。
 - **范围仅老 host 用户**;新用户走 §1 genesis。
 
-**要 Codex 拍**:
-- 触发点放 `spawners` 还是 `supervisor`?lazy-on-spawn(首次延迟一次 §7.B)vs cutover 批一次 —— 倾向 lazy(自愈、不挑时机)。
+**已定(不再待拍)**:**cutover-batch(30-40 一次性 job)+ lazy async enqueue 兜底,禁止 spawn 热路径同步跑 LLM。**
+
+**实现要点**:
 - §7.B 喂 identity 的输入映射:`custom_persona_prompt`→"你是谁"主干、`tone_style`→语气、`self_introduction`→补充;**逐字 exemplars 补不了**(原始历史没留),只出 baseline,Dream 后续养。
 - "有信号才补、全空留空"的判断阈值。
+- ⚠️ 前提:**先解 §8.5 P0(persona decrypt 拿不到 token)**,否则 batch/lazy 写好了 spawn 仍解不出。
 
 ---
 
@@ -69,17 +72,15 @@
 
 - `FEEDLING_HOST_ALL` = 切 host → agent_runtime(或逐用户灰度)。
 - `FEEDLING_GENESIS_WORKER_ENABLED` = 开 genesis worker。
-- Dream 触发(`dream_scheduler` tick)。
-- session cap `AGENT_SESSION_MAX_TURNS` **40 → 20-30**(spec §8/§11.3,防 voice 漂)。
+- Dream 触发(`dream_scheduler` tick) —— 见 §8.5,要确认线上定时打 tick,不是翻 flag 就跑。
+- **session cap:host 侧已默认 24**(`_HOST_SESSION_MAX_TURNS` `spawners.py:56/282`)—— **本次只需验部署 env 不覆盖它**。VPS consumer 默认 40 **不算本次任务**。
 
 ---
 
 ## 5. 依赖与顺序
 
-1. **§1 接线 + 开 worker** → 验**新用户**:onboard → genesis → identity+voice → spawn=TA。
-2. **§2 backfill** + **§3 memory 迁移** → 处理**老用户**(切过来时补 voice / 升级卡)。§2、§3 互相独立。
-3. **灰度翻 `FEEDLING_HOST_ALL`** → host 上 agent_runtime;route-B 逐步退役。
-4. 全程 invariant:identity 写读不受影响(独立于 voice);memory 迁移零黑屏。
+**以 §8.5 末尾的 8 步闸门顺序为唯一准**(避免两个顺序源)。本节不再单列顺序。
+全程 invariant:identity 写读不受影响(独立于 voice);memory 迁移零黑屏。
 
 ---
 
@@ -131,7 +132,9 @@
 
 **新增 3 个闸门(都实锤):**
 
-1. **🔴 P0 硬闸门 —— HOST_ALL 零 roster 下 persona 解不出来。** `_genesis_persona_content`(`spawners.py:231`)靠 **api_key** 走 enclave 解 `genesis_persona` blob,docstring 自己写着 **"token-only auth → tools-only"**;而 HOST_ALL 的 Stage-D entry **没 api_key**(`_resolve_discovered` `supervisor.py:314`,只有 runtime token)→ **全量托管下 voice blob 写了也解不出 → 退通用。** **修法**:让 persona decrypt 支持 **runtime token**,或 supervisor 在 spawn 前 mint token 解好/传好。**这是 voice cutover 的死结,必须先解,否则 §1/§2 都白做。**
+1. **🔴 P0 硬闸门 —— HOST_ALL 零 roster 下 persona 解不出来(含 token 写入时机)。** `_genesis_persona_content`(`spawners.py:231`)靠 **api_key** 走 enclave 解 `genesis_persona` blob,docstring 自己写着 **"token-only auth → tools-only"**;而 HOST_ALL 的 Stage-D entry **没 api_key**(`_resolve_discovered` `supervisor.py:314`,只有 runtime token)→ **全量托管下 voice blob 写了也解不出 → 退通用。**
+   - ⚠️ **还有 token 写入时机问题(Codex 补,已核)**:supervisor 现在是 **`spawn_fn(...)` 之后**才 `_write_token`(`supervisor.py:140` respawn 路),而 persona 是在 **`spawn_fn` 内 seed home 时解的**(`agent_home_files(persona_content=_genesis_persona_content(...))`)→ **解密发生时 token 还没写**。
+   - **修法**:① persona decrypt 支持 **runtime token**;**且** ② **先写/mint token 再 spawn**,或 supervisor mint 好 token **直接传给 spawner**(让 decrypt 当场拿得到)。两者都要,缺时机那半照样解不出。**这是 voice cutover 的死结,必须先解,否则 §1/§2 都白做。**
 
 2. **P1 —— photo 工具 prompt 与 allowlist 不一致。** prompt(`agent_tools_prompt.md:20`)让 agent 用 `photo-recent/photo-read`,io_cli 也实现了(`io_cli.py:230`),但 `_IO_CLI_VERBS`(`spawners.py:43`)**没放 photo** → **Claude 被权限拦**(Codex 可能能跑)。**修法**:补 allowlist 或 prompt 删 photo,二选一对齐。
 
