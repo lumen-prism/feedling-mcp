@@ -90,9 +90,38 @@
 
 ---
 
-## 7. 要 Codex 整体拍的
+## 7. 要 Codex 整体拍的(已 review,见 §8)
 
 - §1 的 iOS↔CVM 加密上传对齐是不是最大风险点?
 - §2 lazy-on-spawn vs cutover-batch,哪个更稳?
 - history_import 退役节奏(和 route-B 一起退 vs 分开)?
-- 有没有我漏的"建好没接 / 切后失效"的块?(我扫过 env flag,认为 cutover/genesis/Dream 都已建、只差翻 flag)
+- 有没有我漏的"建好没接 / 切后失效"的块?
+
+---
+
+## 8. Codex review 收敛(0627,CC 已独立核实全部为真,采纳)
+
+**核心认知更新:"切 runtime" 不是 clean cutover —— route-B / legacy 不能整退。** 这是本轮最大收获,打破"接线+翻 flag"的隐含假设。
+
+### 8.1 上线前闸门(不是直接翻 flag)
+1. **iOS→genesis 上传 E2E**(最大风险):iOS 不是换 URL,要对齐 **envelope 字段 + chunk hash + finalize/status + progress UI**。先把上传合同跑通 E2E。
+2. **genesis worker preflight**(实锤 `supervisor.py:529` `_genesis_worker_should_start` 要 `enabled` **且** `secret`(`FEEDLING_RUNTIME_TOKEN_SECRET`)**且** `enclave_url`(`FEEDLING_ENCLAVE_URL`),缺一 dormant):上线前加 **preflight 检查**,否则"iOS 上传成功但没人蒸 voice"= 假成功。
+
+### 8.2 voice backfill 改:**别在 spawn 热路径同步跑 LLM**(Codex 对,采纳)
+- spawn(发消息热路径)里跑 §7.B LLM 会拖慢/失败。改:**spawn 发现缺 blob 只 enqueue 一个 backfill job;本轮用 identity/工具 baseline 回答,下一轮吃到 voice。**
+- 最稳:**30-40 个老 host 用户先 cutover-batch 一次(一次性 job),lazy(async enqueue)兜底**散户。
+- 幂等;identity 全空则不补、留空交 Dream。
+
+### 8.3 route-B / legacy **部分保留**(实锤,必须拍)
+- **图片 turn 留 legacy**:`agent_runtime_cutover.py:133 should_route = is_enabled and not has_image`(`chat_routes.py:375`)—— **runtime 纯文本,图片走 legacy multimodal**。→ **route-B 整退 = 图片聊天断。** 退役前要么 runtime 支持图片,要么**保留 legacy 多模态路**。
+- **gateway provider 需 `FEEDLING_LITELLM_ENABLE`**:`cutover.py:123` codex+gateway 用户没开 gateway → 回 legacy。HOST_ALL 开了但 LITELLM 没开 → 这批断。
+- **history_import 保留一个版本做回滚/兼容**,不和 route-B 同日硬删(新 iOS 走 genesis,但留旧路兜底)。
+
+### 8.4 收敛后的落地顺序(闸门式)
+1. iOS→genesis 上传 E2E(envelope/hash/status/progress)。
+2. genesis worker preflight(三前置齐才算 ready)。
+3. 老用户 voice:小批 cutover-batch + spawn lazy(**async enqueue,非同步**)兜底。
+4. 明确 **image turn + gateway provider** 的 route-B 保留策略(不整退)。
+5. 最后才翻 `HOST_ALL / GENESIS_WORKER / Dream / session cap`。
+
+**一句话(Codex,采纳):能继续落,但按"补上线前闸门"落,不是直接翻 flag。最该先拆的是 genesis 上传合同 + worker preflight。**
