@@ -181,8 +181,11 @@
 - `d470442` ④B-1:`POST /v1/genesis/persona_backfill` endpoint + `_enclave_get_json_for_gate`/`_identity_plain_for_action` token-aware
 - `5878afd` 修:复位 `apply_outputs` 成功 return(B-1 插入截断了它,CC 核出 Codex 误判为 cosmetic)
 
-**剩余**:
-- 🔨 **④B-3 lazy 触发(唯一剩的新代码,下一轮 fresh focus)**:supervisor tick 内对 `persona_version==""` 用户 POST endpoint。**终版 spec(Codex 拍)**:① supervisor **单独 mint 短 TTL `["genesis","envelope_decrypt"]` token**(不污染 spawn token scopes);② **守卫**(cooldown 防每 tick 重 POST);③ **限速/后台化**(每 tick 至多 1-2 个,别同步阻塞 tick);④ failed 可重试(run_persona_backfill 幂等兜)。
+- `e9e4701` ④**B-3 lazy 触发(完成 ④)**:`sup.tick` 后对 `persona_version==""` 用户 POST endpoint;单独 mint 短 TTL `["genesis","envelope_decrypt"]` token(不污染 spawn scopes)+ cap(`FEEDLING_PERSONA_BACKFILL_MAX_PER_TICK=2`)+ cooldown(`..._COOLDOWN_SEC=3600`)+ best-effort(不阻塞 tick);flag `FEEDLING_PERSONA_BACKFILL_LAZY` 默认关。
+
+**✅ ④ voice backfill 全部完成(11 commit)。**
+
+**剩余(非 ④)**:
 - ④B-2 batch = ops 对 30-40 调 endpoint,**无新代码**。
 - ① iOS 上传改道 genesis(Swift);②/⑥/⑦/⑧ = 已有/策略/ops。
-- P2 单测(persona_backfill 纯件 + 幂等 + apply_outputs 成功路径 + persona_version respawn 条件)归测试步/Codex。
+- P2 单测(persona_backfill 纯件 + 幂等 + apply_outputs 成功路径 + persona_version respawn + B-3 cap/cooldown)归测试步/Codex。
