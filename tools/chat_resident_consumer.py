@@ -211,6 +211,27 @@ AGENT_HTTP_SESSION_KEY_HEADER = os.environ.get(
 
 AGENT_CLI_CMD = os.environ.get("AGENT_CLI_CMD", "")
 AGENT_CLI_PATH = os.environ.get("AGENT_CLI_PATH", "")
+AGENT_HOME = os.environ.get("AGENT_HOME", "")
+_BUSY_SENTINEL = os.path.join(AGENT_HOME, ".agent-busy") if AGENT_HOME else ""
+
+
+def _set_busy(active: bool) -> None:
+    """Create/remove the in-flight marker the supervisor reads to avoid reaping a
+    consumer mid-CLI-turn. Best-effort; no-op when AGENT_HOME is unset (non-hosted
+    deployments)."""
+    if not _BUSY_SENTINEL:
+        return
+    try:
+        if active:
+            with open(_BUSY_SENTINEL, "w") as f:
+                f.write(str(os.getpid()))
+        else:
+            try:
+                os.unlink(_BUSY_SENTINEL)
+            except FileNotFoundError:
+                pass
+    except OSError:
+        pass
 
 CHECKPOINT_FILE = Path(
     os.environ.get("CHECKPOINT_FILE", "/tmp/feedling_chat_checkpoint.json")
@@ -2469,57 +2490,61 @@ def _prepare_cli_command(message: str, image_paths: list[str] | None = None) -> 
 
 
 def call_agent_cli(message: str, image_paths: list[str] | None = None, raw_text: bool = False) -> Any:
-    if not AGENT_CLI_CMD:
-        raise ValueError("AGENT_CLI_CMD is not set for cli mode")
+    _set_busy(True)
+    try:
+        if not AGENT_CLI_CMD:
+            raise ValueError("AGENT_CLI_CMD is not set for cli mode")
 
-    cmd = _prepare_cli_command(message, image_paths=image_paths)
-    command_sid = _cli_flag_value(cmd, "--session-id")
-    log.debug("running cli agent: %s", cmd)
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        cmd = _prepare_cli_command(message, image_paths=image_paths)
+        command_sid = _cli_flag_value(cmd, "--session-id")
+        log.debug("running cli agent: %s", cmd)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
 
-    raw_transport = (result.stdout or "") + "\n" + (result.stderr or "")
-    observed_sid = _extract_session_id(raw_transport) or command_sid
-    if observed_sid:
-        _save_agent_session_id(observed_sid)
-        _record_agent_session_turn(
-            observed_sid,
-            sent_bytes=len((message or "").encode("utf-8")),
-            received_bytes=len(raw_transport.encode("utf-8")),
-        )
+        raw_transport = (result.stdout or "") + "\n" + (result.stderr or "")
+        observed_sid = _extract_session_id(raw_transport) or command_sid
+        if observed_sid:
+            _save_agent_session_id(observed_sid)
+            _record_agent_session_turn(
+                observed_sid,
+                sent_bytes=len((message or "").encode("utf-8")),
+                received_bytes=len(raw_transport.encode("utf-8")),
+            )
 
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"cli agent exited {result.returncode}: "
-            f"{_cli_error_detail(result.stdout or '', result.stderr or '')}"
-        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"cli agent exited {result.returncode}: "
+                f"{_cli_error_detail(result.stdout or '', result.stderr or '')}"
+            )
 
-    # codex `exec --json` streams JSONL events; the assistant's text lives in
-    # `item.completed` events (item.type == "agent_message"), NOT in any field the
-    # generic extractor recognizes. Pull it from the stream before falling through
-    # (else the consumer would mis-send the `thread.started` handshake as the reply).
-    if _is_codex_cmd(cmd):
-        codex_reply = _codex_reply_from_stream(result.stdout)
-        if codex_reply:
-            return codex_reply
+        # codex `exec --json` streams JSONL events; the assistant's text lives in
+        # `item.completed` events (item.type == "agent_message"), NOT in any field the
+        # generic extractor recognizes. Pull it from the stream before falling through
+        # (else the consumer would mis-send the `thread.started` handshake as the reply).
+        if _is_codex_cmd(cmd):
+            codex_reply = _codex_reply_from_stream(result.stdout)
+            if codex_reply:
+                return codex_reply
 
-    raw = result.stdout
-    if raw_text:
-        # Memory lanes parse JSON from the model's literal output. Prefer the
-        # extracted assistant text (drops codex/claude transport framing) but do
-        # NOT route it through the chat-bubble sanitizer in _agent_turn_from_raw,
-        # which would decapitate a pretty-printed JSON object.
+        raw = result.stdout
+        if raw_text:
+            # Memory lanes parse JSON from the model's literal output. Prefer the
+            # extracted assistant text (drops codex/claude transport framing) but do
+            # NOT route it through the chat-bubble sanitizer in _agent_turn_from_raw,
+            # which would decapitate a pretty-printed JSON object.
+            text = _extract_text_from_cli_output(raw)
+            if text.strip():
+                return text
+        turn = _agent_turn_from_raw(raw)
+        if turn.messages or turn.actions or turn.thinking_summary or turn.tool_calls:
+            return raw
         text = _extract_text_from_cli_output(raw)
-        if text.strip():
-            return text
-    turn = _agent_turn_from_raw(raw)
-    if turn.messages or turn.actions or turn.thinking_summary or turn.tool_calls:
-        return raw
-    text = _extract_text_from_cli_output(raw)
-    if not text:
-        raise ValueError(
-            f"cli agent produced no usable output (exit={result.returncode})"
-        )
-    return text
+        if not text:
+            raise ValueError(
+                f"cli agent produced no usable output (exit={result.returncode})"
+            )
+        return text
+    finally:
+        _set_busy(False)
 
 
 def _sanitize_reply_text(text: str) -> str:
@@ -5608,6 +5633,8 @@ def run() -> None:
         capture_tick_enabled,
         CAPTURE_TICK_INTERVAL_SEC,
     )
+
+    _set_busy(False)  # clear stale in-flight marker from a prior crash
 
     consecutive_errors = 0
 

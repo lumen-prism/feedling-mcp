@@ -410,6 +410,18 @@ def test_stale_home_files_gateway_codex_keeps_config():
     assert "/h/codex-home/config.toml" not in stale
 
 
+def test_busy_sentinel_path():
+    from agent_runtime import spawners
+    assert spawners.busy_sentinel_path("/agent-data/users/u_1") == "/agent-data/users/u_1/.agent-busy"
+
+
+def test_consumer_env_exposes_agent_home():
+    from agent_runtime import spawners
+    env = spawners.consumer_env({}, {"api_key": "k", "driver": "claude"},
+                                user_id="u_1", home="/agent-data/users/u_1")
+    assert env["AGENT_HOME"] == "/agent-data/users/u_1"
+
+
 def test_materialize_home_prunes_stale_gateway_config_on_native(tmp_path):
     home = str(tmp_path / "u")
     cfg = tmp_path / "u" / "codex-home" / "config.toml"

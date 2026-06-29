@@ -225,3 +225,67 @@ def test_list_active_returns_only_live_leases():
     assert ids == set()  # both expired at T0+350 (ttl 300)
     active2 = leases.list_active(now=T0 + 100, lease_owner="sup_A")
     assert {r["user_id"] for r in active2} == {"u_1", "u_2"}
+
+
+def test_mark_dormant_parks_the_lease():
+    leases.acquire("u_d", driver="claude", runtime_home="/d/u_d",
+                   lease_owner="sup_A", ttl=300.0, now=T0)
+    leases.renew("u_d", "sup_A", ttl=300.0, pid=4242, status="running", now=T0)
+    # Give last_active_at a known value so we can prove mark_dormant leaves it
+    # alone (the missed-notify backstop invariant: last_active_at must NOT be
+    # advanced to the dormancy moment).
+    leases.set_session_ref("u_d", "sup_A", "sess-1", now=T0 + 10)
+    leases.mark_dormant("u_d", "sup_A", now=T0 + 50)
+
+    row = leases.get("u_d")
+    assert row["status"] == "dormant"
+    assert row["pid"] is None
+    assert row["lease_owner"] is None
+    assert row["lease_expires_at"] is None
+    # dormancy moment recorded on last_heartbeat_at; last_active_at left alone
+    assert int(row["last_heartbeat_at"].timestamp()) == int(T0 + 50)
+    assert int(row["last_active_at"].timestamp()) == int(T0 + 10)  # NOT bumped to T0+50
+
+
+def test_list_dormant_returns_only_dormant_rows():
+    leases.acquire("u_run", driver="claude", runtime_home="/d/u_run",
+                   lease_owner="sup_A", ttl=300.0, now=T0)
+    leases.renew("u_run", "sup_A", ttl=300.0, pid=1, status="running", now=T0)
+    leases.acquire("u_dorm", driver="claude", runtime_home="/d/u_dorm",
+                   lease_owner="sup_A", ttl=300.0, now=T0)
+    leases.mark_dormant("u_dorm", "sup_A", now=T0)
+
+    uids = {r["user_id"] for r in leases.list_dormant()}
+    assert uids == {"u_dorm"}
+
+
+def test_dormant_lease_is_reacquirable():
+    # A parked lease (lease_expires_at NULL) must be acquirable by _wake.
+    leases.acquire("u_w", driver="claude", runtime_home="/d/u_w",
+                   lease_owner="sup_A", ttl=300.0, now=T0)
+    leases.mark_dormant("u_w", "sup_A", now=T0)
+    assert leases.acquire("u_w", driver="claude", runtime_home="/d/u_w",
+                          lease_owner="sup_A", ttl=300.0, now=T0 + 1) is True
+    assert leases.get("u_w")["status"] == "starting"
+
+
+def test_bump_agent_last_active_advances_clock():
+    leases.acquire("u_b", driver="claude", runtime_home="/d/u_b",
+                   lease_owner="sup_A", ttl=300.0, now=T0)
+    leases.mark_dormant("u_b", "sup_A", now=T0)        # last_heartbeat_at = T0
+    before = leases.get("u_b").get("last_active_at")
+
+    db.bump_agent_last_active("u_b")
+
+    row = leases.get("u_b")
+    assert row["last_active_at"] is not None
+    if before is not None:
+        assert row["last_active_at"] >= before
+    # bump must make last_active_at strictly newer than the dormancy heartbeat,
+    # which is exactly the missed-notify backstop signal.
+    assert row["last_active_at"] > row["last_heartbeat_at"]
+
+
+def test_bump_agent_last_active_missing_row_is_noop():
+    # No row for this user -> must not raise.
+    db.bump_agent_last_active("u_does_not_exist")

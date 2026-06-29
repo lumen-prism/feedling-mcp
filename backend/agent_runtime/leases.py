@@ -201,6 +201,36 @@ def release(user_id: str, lease_owner: str, *, now: float | None = None) -> None
         conn.execute(sql, (_now(now), user_id, lease_owner))
 
 
+def mark_dormant(user_id: str, lease_owner: str, *, now: float | None = None) -> None:
+    """Park a live lease as ``dormant`` (idle-reaped). Like ``release`` it clears
+    the lease so another supervisor can re-acquire on wake, but the status label
+    ``dormant`` (vs ``idle``) tells the tick's spawn pass NOT to auto-respawn —
+    this user is parked until a trigger wakes it. ``last_heartbeat_at`` records the
+    dormancy moment; ``last_active_at`` is deliberately left as the real
+    last-activity time so a later activity bump (chat/frame) makes
+    ``last_active_at > last_heartbeat_at``, which the missed-notify backstop keys
+    off. Only the current owner may park it."""
+    sql = """
+        UPDATE agent_runtime_instances SET
+            status = 'dormant', lease_owner = NULL, lease_expires_at = NULL,
+            pid = NULL, last_heartbeat_at = to_timestamp(%s), updated_at = now()
+        WHERE user_id = %s AND lease_owner = %s
+    """
+    with db.get_pool().connection() as conn:
+        conn.execute(sql, (_now(now), user_id, lease_owner))
+
+
+def list_dormant() -> list[dict[str, Any]]:
+    """All parked (``status='dormant'``) rows. Used by the supervisor to skip them
+    in the spawn pass and to evaluate wake triggers."""
+    sql = "SELECT * FROM agent_runtime_instances WHERE status = 'dormant'"
+    with db.get_pool().connection() as conn:
+        cur = conn.execute(sql)
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description]
+    return [dict(zip(cols, r)) for r in rows]
+
+
 def get(user_id: str) -> dict[str, Any] | None:
     sql = "SELECT * FROM agent_runtime_instances WHERE user_id = %s"
     with db.get_pool().connection() as conn:

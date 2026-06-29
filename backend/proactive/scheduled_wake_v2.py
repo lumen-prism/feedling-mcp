@@ -483,6 +483,37 @@ class DBScheduledWakeStoreV2:
         return row[0] if row is not None else None
 
 
+def due_user_ids(*, now: float) -> set[str]:
+    """Cross-user: every user whose LATEST scheduled-wake-v2 timer is due — i.e.
+    pending with ``due_at <= now``, or claimed with an expired claim. The
+    supervisor uses this to wake dormant users for an imminent scheduled wake.
+
+    Correctness leans toward over-inclusion: a woken consumer that finds nothing
+    actually due simply idles again, whereas under-inclusion would drop a wake.
+    DISTINCT ON (user_id, item_key) ... ORDER BY seq DESC takes only the current
+    row per timer, so a fired/canceled timer's superseded 'pending' row can't
+    resurrect a wake. Returns an empty set on any DB error (fail toward not
+    over-waking; the per-tick backstop and push paths remain)."""
+    sql = (
+        "SELECT DISTINCT user_id FROM ("
+        "  SELECT DISTINCT ON (user_id, item_key) user_id, doc"
+        "  FROM user_logs WHERE stream = %s"
+        "  ORDER BY user_id, item_key, seq DESC"
+        ") latest "
+        "WHERE COALESCE(NULLIF(doc->>'due_at','')::float8, 0) > 0 "
+        "  AND COALESCE(NULLIF(doc->>'due_at','')::float8, 0) <= %s "
+        "  AND (doc->>'status' = 'pending' OR (doc->>'status' = 'claimed' "
+        "       AND COALESCE(NULLIF(doc->>'claim_expires_at','')::float8, 0) <= %s))"
+    )
+    try:
+        with db.get_pool().connection() as conn:
+            rows = conn.execute(sql, (SCHEDULED_WAKE_STREAM_V2, now, now)).fetchall()
+        return {r[0] for r in rows}
+    except Exception as e:  # noqa: BLE001
+        log.error("[scheduled_wake_v2] due_user_ids failed: %s", e)
+        return set()
+
+
 WakeSubmitterV2 = Callable[[WakeEventV2], Any]
 
 

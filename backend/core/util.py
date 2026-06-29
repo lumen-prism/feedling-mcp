@@ -28,6 +28,22 @@ def runtime_v2_default_on() -> bool:
     return _env_flag_enabled(RUNTIME_V2_DEFAULT_ON_ENV)
 
 
+def agent_idle_reap_enabled() -> bool:
+    """Feature flag for agent-runner idle-reap + lazy-spawn. OFF by default so
+    prod keeps every enabled user's consumer permanently resident."""
+    return _env_flag_enabled("AGENT_IDLE_REAP_ENABLED", "false")
+
+
+def agent_idle_threshold_sec() -> int:
+    """Seconds a consumer may be idle (no chat/frame/wake activity) before it is
+    eligible for reaping. Default 18 min — far larger than one CLI turn
+    (120s timeout) so an in-flight chat turn can never cross the threshold."""
+    try:
+        return max(1, int(os.environ.get("AGENT_IDLE_THRESHOLD_SEC", "1080")))
+    except (TypeError, ValueError):
+        return 1080
+
+
 # io-onboarding docs branch this code serves skill_url from. Defaults to "main"
 # so a merge to main just works with NO code edit (the old hard-coded constant
 # had to be hand-flipped every cutover — that footgun is gone). The per-deploy

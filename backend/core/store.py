@@ -421,6 +421,10 @@ class UserStore:
         # broadcasts the genuine write. Emitted here (the sole new-message
         # chokepoint), never from the wake/reload path, so it can't loop.
         wake_bus.notify("chat", self.user_id)
+        # Idle-reap activity clock: a genuine chat write keeps the user's hosted
+        # consumer from being reaped mid-conversation, and re-arms a dormant user
+        # for the missed-notify backstop. Best-effort (never raises here).
+        db.bump_agent_last_active(self.user_id)
         try:
             from proactive import capture_scheduler
 

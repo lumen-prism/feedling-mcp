@@ -43,7 +43,9 @@ import socket
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import httpx
 
@@ -56,8 +58,9 @@ if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
 import db
-from core import runtime_token
-from agent_runtime import leases, litellm_gateway, spawners
+from core import runtime_token, wake_bus, util
+from agent_runtime import leases, litellm_gateway, reaper, spawners
+from proactive import dream_scheduler, scheduled_wake_v2
 
 log = logging.getLogger("feedling.agent_runtime.supervisor")
 
@@ -65,6 +68,19 @@ INTRODUCTION_JOB_KIND = "introduction"
 INTRODUCTION_TRIGGER = "post_spawn_genesis"
 INTRODUCTION_INTENT_LABEL = "post_respawn_introduction"
 _INTRODUCTION_ACTIVE_STATUSES = {"pending", "claimed", "realizing"}
+
+
+def _epoch(dt) -> float:
+    """A timestamptz row value (datetime) or None -> epoch seconds (0.0 if unset)."""
+    if dt is None:
+        return 0.0
+    try:
+        return dt.timestamp()
+    except AttributeError:
+        try:
+            return float(dt)
+        except (TypeError, ValueError):
+            return 0.0
 
 
 def parse_roster(raw) -> list[dict]:
@@ -91,6 +107,8 @@ class Supervisor:
         enclave_url: str | None = None,
         introduction_enqueuer=None,
         max_spawns_per_tick: int = 0,
+        idle_reap_enabled: bool = False,
+        idle_threshold_sec: float = 1080.0,
     ) -> None:
         self.owner = owner
         self.lease_ttl = lease_ttl
@@ -112,6 +130,45 @@ class Supervisor:
         # (spawn/reap/respawn) and the dedicated renew thread (renew_live).
         # Reentrant so a method already holding it can call another that takes it.
         self._lock = threading.RLock()
+        self.idle_reap_enabled = idle_reap_enabled
+        self.idle_threshold_sec = idle_threshold_sec
+        self._wake_requests: set[str] = set()
+        self._wake_lock = threading.Lock()
+        self._wake_event = threading.Event()
+        self._tz_cache: dict = {}
+        self._dream_wake_at: dict[str, float] = {}
+
+    def _user_tz(self, user_id: str):
+        tz = self._tz_cache.get(user_id)
+        if tz is not None:
+            return tz
+        name = "UTC"
+        try:
+            settings = db.get_blob(user_id, "proactive_settings")
+            if isinstance(settings, dict) and settings.get("timezone"):
+                name = str(settings["timezone"])
+        except Exception:  # noqa: BLE001
+            name = "UTC"
+        try:
+            tz = ZoneInfo(name)
+        except Exception:  # noqa: BLE001
+            tz = ZoneInfo("UTC")
+        self._tz_cache[user_id] = tz
+        return tz
+
+    def _in_night_window(self, user_id: str, now: float) -> bool:
+        """Whether the user is currently in their dream window. Mirrors
+        dream_scheduler._within_night_window: when night-only is off, always true
+        (dreams may run anytime; the woken consumer dedups via dream_key)."""
+        if not dream_scheduler.night_only():
+            return True
+        local = datetime.fromtimestamp(now, timezone.utc).astimezone(self._user_tz(user_id))
+        start = dream_scheduler.night_start_hour()
+        end = dream_scheduler.night_end_hour()
+        hour = local.hour
+        if start <= end:
+            return start <= hour < end
+        return hour >= start or hour < end
 
     def _write_token(self, user_id: str, home: str) -> None:
         if self.token_writer is None:
@@ -142,7 +199,140 @@ class Supervisor:
         except Exception as e:  # noqa: BLE001 — introduction is best-effort, spawn must continue
             log.warning("introduction enqueue failed for %s: %s", user_id, e)
 
-    def tick(self, roster: list[dict]) -> None:
+    def _enqueue_wake(self, user_id: str) -> None:
+        if not user_id:
+            return
+        with self._wake_lock:
+            self._wake_requests.add(user_id)
+        self._wake_event.set()
+
+    def _drain_wakes(self) -> set[str]:
+        with self._wake_lock:
+            pending = self._wake_requests
+            self._wake_requests = set()
+        return pending
+
+    def _on_notify(self, payload: str) -> None:
+        """Handle one wake-bus NOTIFY. Enqueue a wake for chat/frame writes from
+        OTHER workers (our own writes are tagged with our WORKER_ID and skipped —
+        though as a separate process the supervisor never emits these anyway)."""
+        try:
+            data = json.loads(payload)
+        except Exception:
+            return
+        if data.get("o") == wake_bus.WORKER_ID:
+            return
+        if (data.get("c") or "") in ("chat", "frames"):
+            self._enqueue_wake(data.get("u") or "")
+
+    def wait_for_tick(self, timeout: float) -> None:
+        """Sleep until the next tick, returning early when a push wake arrives.
+        When reaping is disabled the event is never set, so this is a plain sleep."""
+        self._wake_event.wait(timeout)
+        self._wake_event.clear()
+
+    def start_wake_listener(self) -> None:
+        """Daemon thread holding a dedicated LISTEN connection on the wake bus,
+        dispatching chat/frame notifies to _on_notify. Reconnects on drop."""
+        def _loop():
+            while True:
+                conn = None
+                try:
+                    conn = db.listen_connection()
+                    conn.execute(f"LISTEN {wake_bus.PG_CHANNEL}")
+                    log.info("supervisor wake-listener up on %s", wake_bus.PG_CHANNEL)
+                    for note in conn.notifies():
+                        self._on_notify(note.payload)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("supervisor wake-listener error: %s; reconnecting in 5s", e)
+                    time.sleep(5.0)
+                finally:
+                    if conn is not None:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+        threading.Thread(target=_loop, daemon=True, name="sup-wake-listener").start()
+
+    def _wake(self, entry: dict, *, now: float | None = None) -> None:
+        """Spawn a consumer for a dormant/parked user — the single lazy-spawn path
+        for chat/frame/scheduled/dream triggers. Atomic via leases.acquire: if
+        another supervisor wins the race we simply return. Stamps last_active_at at
+        spawn so the very next tick's reap pass doesn't immediately re-reap it.
+
+        ``now`` lets the caller pin every timestamp this wake writes to a single
+        clock value (the dream pull relies on this so its dedup marker can match the
+        exact last_active_at this wake stamps)."""
+        user_id = entry.get("user_id")
+        if not user_id or user_id in self.children:
+            return
+        ts = self._now() if now is None else now
+        home = self._home(user_id)
+        if not leases.acquire(user_id, driver=entry.get("driver", "claude"),
+                              runtime_home=home, lease_owner=self.owner,
+                              ttl=self.lease_ttl, now=ts):
+            return  # another supervisor holds it
+        pid = self.spawn_fn(entry, user_id, home)
+        self._write_token(user_id, home)
+        leases.renew(user_id, self.owner, ttl=self.lease_ttl, pid=pid,
+                     status="running", driver=entry.get("driver"), now=ts)
+        db.bump_agent_last_active(user_id, now=ts)
+        self.children[user_id] = {"pid": pid, "entry": entry, "home": home}
+        log.info("woke dormant consumer for %s (pid=%s)", user_id, pid)
+
+    def wake_pass(self, roster: list[dict]) -> set[str]:
+        """Wake dormant users whose work has arrived: pushed chat/frame notifies,
+        due scheduled timers, and the missed-notify backstop (a dormant row whose
+        last_active_at advanced past the dormancy heartbeat). Returns the dormant
+        uid set so the caller can pass it to tick() without re-querying."""
+        if not self.idle_reap_enabled:
+            return set()
+        now = self._now()  # one clock for this whole pass (dream dedup depends on it)
+        dormant_rows = leases.list_dormant()
+        dormant_uids = {r["user_id"] for r in dormant_rows}
+        by_uid = {e["user_id"]: e for e in roster if e.get("user_id")}
+        push = self._drain_wakes()
+        scheduled = scheduled_wake_v2.due_user_ids(now=now)
+        backstop = {r["user_id"] for r in dormant_rows
+                    if _epoch(r["last_active_at"]) > _epoch(r["last_heartbeat_at"])}
+        to_wake = reaper.wakes_due(dormant_uids=dormant_uids, scheduled_due_uids=scheduled,
+                                   backstop_uids=backstop, push_uids=push)
+        for uid in to_wake:
+            entry = by_uid.get(uid)
+            if entry is not None:
+                self._wake(entry, now=now)
+        # Dream pull: wake an in-window dormant user that has had activity since we
+        # last woke it to dream. The woken consumer's proactive tick runs the
+        # authoritative undigested-moments check (dream_key dedup); a user with
+        # nothing new simply idles back to dormant.
+        # KNOWN LIMITATION (acceptable): `_dream_wake_at` is per-process, not
+        # persisted. After a supervisor restart (or under multiple supervisors) the
+        # marker resets, so each dormant user with historical activity may be
+        # dream-woken once more that night. This is bounded extra wakes, never
+        # duplicated dream work (the consumer's dream_key is the real dedup) and
+        # never message loss — within the "over-wake is safe" design. Persisting it
+        # (a DB column) is deferred to if/when multi-supervisor is actually run.
+        for r in dormant_rows:
+            uid = r["user_id"]
+            if uid in self.children or uid not in by_uid:
+                continue
+            if reaper.dream_wake_due(in_window=self._in_night_window(uid, now),
+                                     last_active_at=_epoch(r["last_active_at"]),
+                                     last_dream_wake_at=self._dream_wake_at.get(uid, 0.0)):
+                self._wake(by_uid[uid], now=now)
+                # Mark the dream wake at the value last_active_at ACTUALLY stored
+                # (Postgres rounds epoch->microsecond), not the raw float `now`.
+                # _wake's own bump would otherwise leave last_active_at a sub-
+                # microsecond AHEAD of `now`, so the strict-`>` dedup would re-fire
+                # the dream every idle window with no new activity. Reading it back
+                # makes the marker exactly equal, so only genuinely newer activity
+                # (a real chat/frame bump) re-triggers a dream.
+                woken = leases.get(uid)
+                self._dream_wake_at[uid] = _epoch(woken["last_active_at"]) if woken else now
+        # re-derive dormant after waking, for tick's spawn-skip
+        return dormant_uids - set(self.children)
+
+    def tick(self, roster: list[dict], *, dormant_uids: set[str] | None = None) -> None:
         """One supervision pass: heartbeat live children, reap dead ones, drop
         children whose user left the roster, and acquire+spawn for any user we
         don't already run."""
@@ -161,6 +351,33 @@ class Supervisor:
                     self.children.pop(user_id, None)
 
         spawned_this_tick = 0
+        # Idle-reap pass: park live consumers that have been idle past the
+        # threshold and are not mid-CLI-turn. Runs before renew/spawn so a reaped
+        # user is neither renewed nor respawned this tick. (Feature-gated.) Reads
+        # last_active_at via leases.get(uid) per child — NOT list_active — so a
+        # momentarily-expired lease can't hide the row (mark_dormant still requires
+        # we own it, which fails safe).
+        reaped_now: set[str] = set()  # parked THIS tick — must be skipped by the spawn pass below
+        if self.idle_reap_enabled and self.children:
+            now = self._now()
+            with self._lock:
+                tracked_reap = list(self.children.items())
+            for uid, child in tracked_reap:
+                if not self.alive_fn(child["pid"]):
+                    continue  # dead child handled by the normal pass below
+                row = leases.get(uid)
+                last_active = _epoch(row.get("last_active_at")) if row else 0.0
+                in_flight = os.path.exists(spawners.busy_sentinel_path(child["home"]))
+                if reaper.should_reap(last_active_at=last_active, now=now,
+                                      idle_sec=self.idle_threshold_sec, in_flight=in_flight):
+                    self.kill_fn(child["pid"])
+                    leases.mark_dormant(uid, self.owner, now=now)
+                    with self._lock:
+                        self.children.pop(uid, None)
+                    reaped_now.add(uid)
+                    log.info("idle-reap: parked %s as dormant (idle>%.0fs)",
+                             uid, self.idle_threshold_sec)
+
         for entry in roster:
             user_id = str(entry.get("user_id") or "")
             if not user_id:
@@ -198,6 +415,11 @@ class Supervisor:
                                      status="running", driver=entry.get("driver"),
                                      now=self._now())
                         self.children[user_id] = {"pid": pid, "entry": entry, "home": home}
+                        if self.idle_reap_enabled:
+                            # A config-change respawn is fresh work for this user; restart
+                            # the idle clock so a stale last_active_at doesn't get the
+                            # just-respawned consumer reaped on the very next tick.
+                            db.bump_agent_last_active(user_id, now=self._now())
                     self._enqueue_introduction(user_id, entry)
                 else:
                     self._write_token(user_id, child["home"])  # refresh short-lived token
@@ -209,6 +431,20 @@ class Supervisor:
                 with self._lock:
                     self.children.pop(user_id, None)
 
+            # Spawn pass: resolve the dormant set once and skip parked users.
+            if self.idle_reap_enabled and dormant_uids is None:
+                dormant_uids = {r["user_id"] for r in leases.list_dormant()}
+            # Only honor the dormant-skip when reaping is enabled, so a caller that
+            # passes dormant_uids can never block spawns on the default-off path.
+            # Union in reaped_now: a caller-supplied dormant_uids (from wake_pass)
+            # was computed BEFORE this tick's reap pass, so it omits users parked
+            # during this very tick — without this union the spawn pass would
+            # re-acquire + respawn a just-reaped user every tick (flap that defeats
+            # the feature).
+            _dormant = ((dormant_uids or set()) | reaped_now) if self.idle_reap_enabled else set()
+            if user_id in _dormant:
+                continue  # parked — only a trigger (via _wake) brings it back
+
             if not _genesis_ready_to_spawn(user_id):
                 # "先 genesis 后 spawn" (spec §5): don't boot a blank consumer while
                 # an import genesis is still distilling persona/facts. Fresh-start
@@ -219,6 +455,16 @@ class Supervisor:
                 # Per-tick spawn cap reached — spawn the remaining users next tick
                 # (don't even acquire, so another supervisor could take them).
                 continue
+            # Final dormancy recheck before acquire (multi-supervisor safety):
+            # another supervisor may have parked this user AFTER our wake_pass
+            # snapshot, so the in-memory dormant set above can be stale. acquire()
+            # CAN take a dormant row (mark_dormant cleared lease_expires_at) — but
+            # that path is reserved for _wake's trigger-driven lazy-spawn. The
+            # auto-spawn pass must never reactivate a parked user with no trigger.
+            if self.idle_reap_enabled:
+                _row = leases.get(user_id)
+                if _row and _row.get("status") == "dormant":
+                    continue  # parked — only a wake trigger (via _wake) brings it back
             home = self._home(user_id)
             if not leases.acquire(user_id, driver=entry.get("driver", "claude"),
                                   runtime_home=home, lease_owner=self.owner,
@@ -231,6 +477,8 @@ class Supervisor:
                          status="running", now=self._now())
             with self._lock:
                 self.children[user_id] = {"pid": pid, "entry": entry, "home": home}
+            if self.idle_reap_enabled:
+                db.bump_agent_last_active(user_id, now=self._now())  # start idle clock at spawn
             log.info("spawned resident consumer for %s (pid=%s, home=%s)", user_id, pid, home)
             self._enqueue_introduction(user_id, entry)
 
@@ -1068,7 +1316,11 @@ def main() -> int:
         owner=owner, lease_ttl=lease_ttl, data_root=data_root,
         spawn_fn=spawn_fn, alive_fn=alive_fn, kill_fn=kill_fn,
         token_writer=token_writer, max_spawns_per_tick=max_spawns_per_tick,
+        idle_reap_enabled=util.agent_idle_reap_enabled(),
+        idle_threshold_sec=float(util.agent_idle_threshold_sec()),
     )
+    if util.agent_idle_reap_enabled():
+        sup.start_wake_listener()
     log.info("supervisor up — owner=%s base_users=%d autodiscover=%s host_all=%s gateway=%s ttl=%.0fs",
              owner, len(base_roster), autodiscover, host_all_active, gateway_enabled, lease_ttl)
 
@@ -1144,7 +1396,8 @@ def main() -> int:
                     _entry["persona_version"] = _persona_version(_entry.get("user_id", ""))
                 if gateway_mgr is not None:
                     gateway_mgr.reconcile(gateways)
-                sup.tick(roster)
+                dormant_uids = sup.wake_pass(roster)
+                sup.tick(roster, dormant_uids=dormant_uids)
                 # Gate 4 B-3: after the spawn reconcile, top up voice for no-blob users
                 # (bounded + cooldown'd so it never blocks the tick). Off by default.
                 if _lazy_persona_backfill_enabled():
@@ -1174,7 +1427,7 @@ def main() -> int:
                         threading.Thread(target=_autoverify, daemon=True).start()
             except Exception as e:  # noqa: BLE001
                 log.exception("supervisor tick failed: %s", e)
-            time.sleep(interval)
+            sup.wait_for_tick(interval)
     except KeyboardInterrupt:
         log.info("interrupted; releasing leases")
         return 0

@@ -66,6 +66,16 @@ _AGENT_PROMPT_TEXT = (Path(__file__).resolve().parent / "agent_tools_prompt.md")
 _AGENT_PROMPT_BASENAME = "agent-tools-prompt.md"
 
 
+BUSY_SENTINEL_NAME = ".agent-busy"
+
+
+def busy_sentinel_path(home: str) -> str:
+    """Path of the in-flight marker the consumer creates while a CLI turn is
+    running. The supervisor treats its presence as ``in_flight`` and will not reap
+    that consumer (see agent_runtime.reaper.should_reap)."""
+    return f"{home}/{BUSY_SENTINEL_NAME}"
+
+
 def runtime_token_path(home: str) -> str:
     """Path of the per-user runtime-token file the supervisor writes and the
     consumer reads (Stage D)."""
@@ -357,6 +367,7 @@ def consumer_env(base_env: dict, entry: dict, *, user_id: str, home: str) -> dic
     env.setdefault("AGENT_SESSION_MAX_TURNS", _HOST_SESSION_MAX_TURNS)
     env["IMAGE_TEMP_DIR"] = f"{home}/images"
     env["CONSUMER_ID"] = f"agent-runner:{user_id}"
+    env["AGENT_HOME"] = home  # consumer writes the busy sentinel here
     # Stage D: the consumer reads its short-lived runtime token from this file
     # (refreshed by the supervisor). Absent/empty → it falls back to the api key.
     env["FEEDLING_RUNTIME_TOKEN_FILE"] = runtime_token_path(home)
@@ -493,7 +504,7 @@ class ProcessSpawner:
 _CONSUMER_ENV_KEYS = (
     "FEEDLING_API_KEY", "FEEDLING_API_URL", "FEEDLING_ENCLAVE_URL",
     "AGENT_MODE", "AGENT_CLI_CMD", "CHECKPOINT_FILE", "AGENT_SESSION_FILE",
-    "IMAGE_TEMP_DIR", "CONSUMER_ID", "FEEDLING_RUNTIME_TOKEN_FILE",
+    "IMAGE_TEMP_DIR", "CONSUMER_ID", "AGENT_HOME", "FEEDLING_RUNTIME_TOKEN_FILE",
     "ANTHROPIC_API_KEY", "CODEX_API_KEY", "CLAUDE_CONFIG_DIR", "CODEX_HOME",
     "FEEDLING_LITELLM_BASE_URL", "FEEDLING_LITELLM_API_KEY",
 )

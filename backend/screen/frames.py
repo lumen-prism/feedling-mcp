@@ -75,6 +75,11 @@ def _save_frame_envelope(store: UserStore, payload: dict, env: dict):
     item_id = env.get("id") or uuid.uuid4().hex
     ts = payload.get("ts") or time.time()
     db.frame_upsert(store.user_id, item_id, ts, env)
+    # Idle-reap activity clock: perception frames are underlying activity too, so
+    # a perceiving-but-not-chatting user is not reaped and a dormant user re-arms
+    # the backstop. The "frames" wake broadcast (other workers / the supervisor's
+    # listener) is emitted by store._persist_frames_meta below.
+    db.bump_agent_last_active(store.user_id)
 
     meta = {
         "filename": f"{item_id}.env.json",

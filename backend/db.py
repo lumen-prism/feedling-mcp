@@ -30,6 +30,7 @@ import json
 import logging
 import os
 import threading
+import time
 from pathlib import Path
 
 import psycopg
@@ -742,6 +743,27 @@ def list_agent_runtime_enabled_users(include_gateway: bool = False) -> list[dict
     except Exception as e:
         log.error("[db] list_agent_runtime_enabled_users failed: %s", e)
         return []
+
+
+def bump_agent_last_active(user_id: str, *, now: float | None = None) -> None:
+    """Stamp ``agent_runtime_instances.last_active_at`` for a user. Called from the
+    backend write chokepoints (chat append, frame ingest) so the supervisor's
+    idle-reap clock reflects real underlying activity. ``now`` defaults to
+    ``time.time()``; the supervisor passes its injected clock so reap arithmetic
+    stays on a single clock (deterministic under a fake test clock). Best-effort
+    and owner-agnostic: the backend is not the lease owner, and a user with no
+    hosted row (not enabled) simply has nothing to bump. Never raises into the
+    request path — a missed bump only risks an over-eager reap, which the wake
+    triggers immediately recover from."""
+    ts = time.time() if now is None else now
+    try:
+        with get_pool().connection() as conn:
+            conn.execute(
+                "UPDATE agent_runtime_instances SET last_active_at = to_timestamp(%s) WHERE user_id = %s",
+                (ts, user_id),
+            )
+    except Exception as e:  # noqa: BLE001
+        log.error("[db] bump_agent_last_active(%s) failed: %s", user_id, e)
 
 
 def try_stamp_hosted_tick(user_id: str, doc: dict, now: float, interval_sec: float) -> bool:
