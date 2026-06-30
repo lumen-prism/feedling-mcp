@@ -277,7 +277,11 @@ class Supervisor:
         leases.renew(user_id, self.owner, ttl=self.lease_ttl, pid=pid,
                      status="running", driver=entry.get("driver"), now=ts)
         db.bump_agent_last_active(user_id, now=ts)
-        self.children[user_id] = {"pid": pid, "entry": entry, "home": home}
+        # Guard against the dedicated renew thread snapshotting self.children
+        # mid-mutation ("dict changed size during iteration"): renew_live takes
+        # _lock before iterating, so a lazy-spawn write must take it too.
+        with self._lock:
+            self.children[user_id] = {"pid": pid, "entry": entry, "home": home}
         log.info("woke dormant consumer for %s (pid=%s)", user_id, pid)
 
     def wake_pass(self, roster: list[dict]) -> set[str]:
@@ -329,8 +333,11 @@ class Supervisor:
                 # (a real chat/frame bump) re-triggers a dream.
                 woken = leases.get(uid)
                 self._dream_wake_at[uid] = _epoch(woken["last_active_at"]) if woken else now
-        # re-derive dormant after waking, for tick's spawn-skip
-        return dormant_uids - set(self.children)
+        # re-derive dormant after waking, for tick's spawn-skip. Snapshot under
+        # _lock so the renew thread can't pop mid-iteration.
+        with self._lock:
+            running = set(self.children)
+        return dormant_uids - running
 
     def tick(self, roster: list[dict], *, dormant_uids: set[str] | None = None) -> None:
         """One supervision pass: heartbeat live children, reap dead ones, drop
