@@ -1607,6 +1607,54 @@ def world_book_replace_all(user_id: str, entries: list[dict]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# MCP server entries (row-per-item)
+# ---------------------------------------------------------------------------
+
+
+def mcp_server_load(user_id: str) -> list[dict]:
+    try:
+        with get_pool().connection() as conn:
+            rows = conn.execute(
+                "SELECT doc FROM mcp_server_entries WHERE user_id = %s "
+                "ORDER BY updated_at, entry_id",
+                (user_id,),
+            ).fetchall()
+        return [r[0] for r in rows]
+    except Exception as e:
+        log.error("[db] mcp_server_load(%s) failed: %s", user_id, e)
+        return []
+
+
+def mcp_server_upsert(user_id: str, entry_id: str, updated_at: str, doc: dict) -> bool:
+    try:
+        with get_pool().connection() as conn:
+            conn.execute(
+                "INSERT INTO mcp_server_entries (user_id, entry_id, updated_at, doc) "
+                "VALUES (%s, %s, %s, %s) "
+                "ON CONFLICT (user_id, entry_id) DO UPDATE SET "
+                "updated_at = EXCLUDED.updated_at, doc = EXCLUDED.doc",
+                (user_id, entry_id, updated_at or "", Jsonb(doc)),
+            )
+        return True
+    except Exception as e:
+        log.error("[db] mcp_server_upsert(%s,%s) failed: %s", user_id, entry_id, e)
+        return False
+
+
+def mcp_server_delete(user_id: str, entry_id: str) -> bool:
+    try:
+        with get_pool().connection() as conn:
+            cur = conn.execute(
+                "DELETE FROM mcp_server_entries WHERE user_id = %s AND entry_id = %s",
+                (user_id, entry_id),
+            )
+        return cur.rowcount > 0
+    except Exception as e:
+        log.error("[db] mcp_server_delete(%s,%s) failed: %s", user_id, entry_id, e)
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Frame envelopes (heavy body_ct lives here; frames_meta index stays a blob)
 # ---------------------------------------------------------------------------
 

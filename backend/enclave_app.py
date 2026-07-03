@@ -67,6 +67,7 @@ from dstack_tls import derive_tls_cert_and_key, TLS_KEY_PATH
 
 import provider_client
 import worldbook_readside_core
+import mcp_readside_core
 
 
 # ---------------------------------------------------------------------------
@@ -1398,6 +1399,45 @@ def v1_worldbook_match():
     response = worldbook_readside_core.build_block(entries, messages)
     response["user_id"] = authorized_user_id
     response["unavailable_ids"] = unavailable_ids
+    return jsonify(response)
+
+
+@app.route("/v1/mcp/validate", methods=["POST"])
+def v1_mcp_validate():
+    _api_key, authorized_user_id, content_sk, error = _memory_readside_auth_context()
+    if error is not None:
+        body, status = error
+        return jsonify(body), status
+    payload = request.get_json(silent=True) or {}
+    envelopes = payload.get("mcp_servers")
+    if not isinstance(envelopes, list):
+        return jsonify({"error": "mcp_servers must be a list"}), 400
+
+    servers: list[dict] = []
+    invalid: list[dict] = []
+    for envelope in envelopes:
+        if not isinstance(envelope, dict):
+            continue
+        entry_id = str(envelope.get("id") or "")
+        if envelope.get("visibility") == "local_only" or not envelope.get("K_enclave"):
+            invalid.append({"id": entry_id, "error": "enclave key unavailable"})
+            continue
+        try:
+            plaintext = _decrypt_envelope(envelope, authorized_user_id or "", content_sk)
+            inner = json.loads(plaintext.decode("utf-8"))
+            if not isinstance(inner, dict):
+                raise ValueError("MCP server plaintext is not an object")
+        except (DecryptFailure, json.JSONDecodeError, ValueError):
+            invalid.append({"id": entry_id, "error": "decrypt failed"})
+            continue
+        if entry_id and str(inner.get("id") or "").strip() != entry_id:
+            invalid.append({"id": entry_id, "error": "plaintext id does not match envelope id"})
+            continue
+        servers.append(inner)
+
+    response = mcp_readside_core.validate_plain_servers(servers)
+    response["invalid"] = invalid + response.get("invalid", [])
+    response["user_id"] = authorized_user_id
     return jsonify(response)
 
 
