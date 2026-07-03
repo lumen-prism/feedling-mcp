@@ -10,6 +10,11 @@ import httpx
 import mcp_config_validate
 
 
+def _raise_enclave_http_error(status_code: int) -> None:
+    """Raise without response body; MCP config bodies may carry user headers."""
+    raise RuntimeError(f"enclave_http_{status_code}")
+
+
 def validate_plain_servers(servers: list[dict]) -> dict:
     valid_ids: list[str] = []
     invalid: list[dict] = []
@@ -78,7 +83,7 @@ def post_enclave_mcp_validate(
     except httpx.HTTPError as e:
         raise RuntimeError(f"enclave_error:{type(e).__name__}") from e
     if resp.status_code >= 400:
-        raise RuntimeError(f"enclave_http_{resp.status_code}:{resp.text[:180]}")
+        _raise_enclave_http_error(resp.status_code)
     response: Any = resp.json()
     if not isinstance(response, dict):
         raise RuntimeError("enclave_invalid_mcp_response")
@@ -105,7 +110,7 @@ def post_enclave_mcp_render(
     except httpx.HTTPError as e:
         raise RuntimeError(f"enclave_error:{type(e).__name__}") from e
     if resp.status_code >= 400:
-        raise RuntimeError(f"enclave_http_{resp.status_code}:{resp.text[:180]}")
+        _raise_enclave_http_error(resp.status_code)
     response: Any = resp.json()
     if not isinstance(response, dict):
         raise RuntimeError("enclave_invalid_mcp_response")
