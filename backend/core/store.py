@@ -110,6 +110,8 @@ class UserStore:
         self.memory_lock = threading.Lock()
         self.world_books: list[dict] = []
         self.world_books_lock = threading.Lock()
+        self.mcp_servers: list[dict] = []  # MCP-FEATURE (collection + _load/upsert/delete_mcp_server below)
+        self.mcp_servers_lock = threading.Lock()
         self.consumer_state_lock = threading.Lock()
 
         # proactive presence state
@@ -135,6 +137,7 @@ class UserStore:
             self._load_chat()
             self._load_frames_meta()
             self._load_world_books()
+            self._load_mcp_servers()
         finally:
             _reload_guard.active = _prev_guard
 
@@ -298,6 +301,8 @@ class UserStore:
                 self._load_frames_meta()
             with self.world_books_lock:
                 self._load_world_books()
+            with self.mcp_servers_lock:
+                self._load_mcp_servers()
             self._load_tokens()
             self._load_live_activity_state()
             self._load_push_state()
@@ -470,6 +475,44 @@ class UserStore:
             ]
             removed_local = len(self.world_books) != before
             removed_db = db.world_book_delete(self.user_id, entry_id)
+        return removed_local or removed_db
+
+    # ------- MCP servers -------
+    def _load_mcp_servers(self):
+        self.mcp_servers = db.mcp_server_load(self.user_id)
+
+    def upsert_mcp_server(self, record: dict) -> dict:
+        entry_id = str(record.get("id") or "").strip()
+        if not entry_id:
+            raise ValueError("MCP server record id is required")
+        stored = dict(record)
+        stored["id"] = entry_id
+        stored.setdefault("owner_user_id", self.user_id)
+        stored.setdefault("updated_at", datetime.now().isoformat())
+        with self.mcp_servers_lock:
+            replaced = False
+            for i, existing in enumerate(self.mcp_servers):
+                if str(existing.get("id") or "") == entry_id:
+                    self.mcp_servers[i] = stored
+                    replaced = True
+                    break
+            if not replaced:
+                self.mcp_servers.append(stored)
+            db.mcp_server_upsert(self.user_id, entry_id, str(stored.get("updated_at") or ""), stored)
+        return stored
+
+    def delete_mcp_server(self, entry_id: str) -> bool:
+        entry_id = str(entry_id or "").strip()
+        if not entry_id:
+            return False
+        with self.mcp_servers_lock:
+            before = len(self.mcp_servers)
+            self.mcp_servers[:] = [
+                item for item in self.mcp_servers
+                if str(item.get("id") or "") != entry_id
+            ]
+            removed_local = len(self.mcp_servers) != before
+            removed_db = db.mcp_server_delete(self.user_id, entry_id)
         return removed_local or removed_db
 
     def update_chat_message_metadata(self, msg_id: str, fields: dict) -> dict | None:

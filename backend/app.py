@@ -95,6 +95,7 @@ import chat as chat_pkg
 import identity as identity_pkg
 import memory as memory_pkg
 import worldbook as worldbook_pkg
+import mcp as mcp_pkg
 import proactive as proactive_pkg
 from bootstrap import gates as boot_gates
 from bootstrap import routes as bootstrap_routes
@@ -421,6 +422,12 @@ proactive_pkg.register(app)
 identity_pkg.register(app)
 memory_pkg.register(app)
 worldbook_pkg.register(app)
+# MCP-FEATURE: the whole MCP feature is greppable via `grep -rn MCP-FEATURE backend/`.
+# To remove it, delete the self-contained new files (backend/mcp/, mcp_config_validate.py,
+# mcp_readside_core.py, alembic/versions/0012_mcp_server_entries.py) and revert the tagged
+# touchpoints in store.py, db.py, enclave_app.py, agent_runtime/spawners.py + supervisor.py,
+# and this line. Design: feedling-mcp-ios Docs/.../2026-07-03-mcp-client-design.md
+mcp_pkg.register(app)  # MCP-FEATURE
 bootstrap_pkg.register(app)
 genesis_pkg.register(app)
 chat_pkg.register(app)

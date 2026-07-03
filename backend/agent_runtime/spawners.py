@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -93,6 +94,7 @@ def write_runtime_token(home: str, token: str) -> None:
 _CODEX_NATIVE_PROVIDERS = {"openai"}
 # The codex provider id for the gateway (referenced in config.toml + cli).
 _GATEWAY_PROVIDER_ID = "feedling_gateway"
+_MCP_CLAUDE_CONFIG_BASENAME = "mcp.json"
 
 
 def _codex_transport(entry: dict) -> str:
@@ -108,24 +110,101 @@ def _codex_transport(entry: dict) -> str:
     return "gateway"
 
 
-def _codex_gateway_config(*, base_url: str, model: str) -> str:
-    """codex ``config.toml`` routing it through the in-CVM LiteLLM gateway: codex
-    talks OpenAI Responses to ``base_url`` (the gateway), authenticating with the
-    gateway key in ``CODEX_API_KEY``; the gateway holds the upstream provider key
-    and translates to the real provider."""
+def _toml_string(value: str) -> str:
+    return json.dumps(str(value))
+
+
+# MCP-FEATURE: injection gate. Everything MCP in this file keys off this — an empty
+# result means the spawn/config path behaves exactly as before MCP existed. To remove
+# the feature, drop the MCP helpers + the `_enabled_mcp_servers(...)` call sites here.
+def _enabled_mcp_servers(mcp_servers: list[dict] | None) -> list[dict]:
+    out: list[dict] = []
+    for server in mcp_servers or []:
+        if not isinstance(server, dict) or server.get("enabled") is False:
+            continue
+        if not str(server.get("slug") or "").strip():
+            continue
+        if not str(server.get("url") or "").strip():
+            continue
+        out.append(server)
+    return out
+
+
+def _mcp_bearer_env_name(slug: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_]", "_", slug).upper()
+    return f"FEEDLING_MCP_{safe}_BEARER_TOKEN"
+
+
+def _authorization_bearer(headers: dict | None) -> str:
+    if not isinstance(headers, dict):
+        return ""
+    raw = str(headers.get("Authorization") or headers.get("authorization") or "").strip()
+    if raw.lower().startswith("bearer "):
+        return raw[7:].strip()
+    return ""
+
+
+def _codex_config(
+    *,
+    base_url: str = "",
+    model: str = "",
+    mcp_servers: list[dict] | None = None,
+) -> str:
+    """Codex config.toml merging LiteLLM gateway routing and HTTP MCP servers."""
     lines = []
-    if model:
+    if base_url and model:
         lines.append(f'model = "{model}"')
-    lines += [
-        f'model_provider = "{_GATEWAY_PROVIDER_ID}"',
-        "",
-        f"[model_providers.{_GATEWAY_PROVIDER_ID}]",
-        'name = "feedling-litellm"',
-        f'base_url = "{base_url}"',
-        'wire_api = "responses"',
-        'env_key = "CODEX_API_KEY"',
-    ]
+    if base_url:
+        lines += [
+            f'model_provider = "{_GATEWAY_PROVIDER_ID}"',
+            "",
+            f"[model_providers.{_GATEWAY_PROVIDER_ID}]",
+            'name = "feedling-litellm"',
+            f'base_url = "{base_url}"',
+            'wire_api = "responses"',
+            'env_key = "CODEX_API_KEY"',
+        ]
+    for server in _enabled_mcp_servers(mcp_servers):
+        slug = str(server.get("slug") or "").strip()
+        url = str(server.get("url") or "").strip()
+        lines += ["", f"[mcp_servers.{slug}]", f"url = {_toml_string(url)}"]
+        bearer = _authorization_bearer(server.get("headers"))
+        if bearer:
+            lines.append(f"bearer_token_env_var = {_toml_string(_mcp_bearer_env_name(slug))}")
     return "\n".join(lines) + "\n"
+
+
+def _codex_gateway_config(*, base_url: str, model: str) -> str:
+    """Backward-compatible wrapper for callers that only need gateway routing."""
+    return _codex_config(base_url=base_url, model=model)
+
+
+def _claude_mcp_config(mcp_servers: list[dict] | None) -> str:
+    servers: dict[str, dict] = {}
+    for server in _enabled_mcp_servers(mcp_servers):
+        slug = str(server.get("slug") or "").strip()
+        entry = {"type": "http", "url": str(server.get("url") or "").strip()}
+        headers = server.get("headers")
+        if isinstance(headers, dict) and headers:
+            entry["headers"] = {str(k): str(v) for k, v in headers.items()}
+        servers[slug] = entry
+    return json.dumps({"mcpServers": servers}, indent=2, sort_keys=True) + "\n"
+
+
+def _mcp_allow_rules(mcp_servers: list[dict] | None) -> list[str]:
+    return [
+        f"mcp__{str(server.get('slug') or '').strip()}"
+        for server in _enabled_mcp_servers(mcp_servers)
+    ]
+
+
+def _codex_mcp_env(mcp_servers: list[dict] | None) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for server in _enabled_mcp_servers(mcp_servers):
+        token = _authorization_bearer(server.get("headers"))
+        if token:
+            out[_mcp_bearer_env_name(str(server.get("slug") or ""))] = token
+    return out
 
 
 def _io_cli_allow_rules(io_cli: str = _IO_CLI) -> list[str]:
@@ -214,7 +293,12 @@ def _identity_override_block(provider: str, model: str, base_url: str) -> str:
     )
 
 
-def _default_cli_cmd(driver: str, home: str, io_cli: str = _IO_CLI) -> str:
+def _default_cli_cmd(
+    driver: str,
+    home: str,
+    io_cli: str = _IO_CLI,
+    mcp_servers: list[dict] | None = None,
+) -> str:
     """Default cli command per driver (resident substitutes ``{message}``).
 
     For claude we pre-grant the io_cli verbs (so an unattended
@@ -252,22 +336,33 @@ def _default_cli_cmd(driver: str, home: str, io_cli: str = _IO_CLI) -> str:
             "-c model_reasoning_summary=auto "
             "--dangerously-bypass-approvals-and-sandbox {message}"
         )
-    grant = ",".join(_claude_allow_rules(io_cli, home))
+    # merge: keep test's _claude_allow_rules (io_cli + image-read) AND append MCP rules
+    grant = ",".join(_claude_allow_rules(io_cli, home) + _mcp_allow_rules(mcp_servers))
     prompt_file = f"{home}/{_AGENT_PROMPT_BASENAME}"
+    mcp_arg = ""
+    if _enabled_mcp_servers(mcp_servers):
+        mcp_arg = f" --mcp-config {home}/claude-home/{_MCP_CLAUDE_CONFIG_BASENAME}"
     return (
         f"claude --allowed-tools '{grant}' "
-        f"--append-system-prompt-file {prompt_file} -p {{message}}"
+        f"--append-system-prompt-file {prompt_file}{mcp_arg} -p {{message}}"
     )
 
 
-def _default_thinking_claude_cmd(home: str, io_cli: str = _IO_CLI) -> str:
+def _default_thinking_claude_cmd(
+    home: str,
+    io_cli: str = _IO_CLI,
+    mcp_servers: list[dict] | None = None,
+) -> str:
     """Claude Code exposes thinking blocks in stream-json output."""
-    grant = ",".join(_io_cli_allow_rules(io_cli))
+    grant = ",".join(_io_cli_allow_rules(io_cli) + _mcp_allow_rules(mcp_servers))
     prompt_file = f"{home}/{_AGENT_PROMPT_BASENAME}"
+    mcp_arg = ""
+    if _enabled_mcp_servers(mcp_servers):
+        mcp_arg = f" --mcp-config {home}/claude-home/{_MCP_CLAUDE_CONFIG_BASENAME}"
     return (
         "claude --verbose --output-format stream-json --include-partial-messages "
         f"--effort high --allowed-tools '{grant}' "
-        f"--append-system-prompt-file {prompt_file} -p {{message}}"
+        f"--append-system-prompt-file {prompt_file}{mcp_arg} -p {{message}}"
     )
 
 
@@ -297,6 +392,7 @@ def agent_home_files(
     base_url: str = "",
     provider: str = "",
     identity_model: str = "",
+    mcp_servers: list[dict] | None = None,
 ) -> dict[str, str]:
     """Per-user files seeded into the agent home before spawn (pure: path→content).
 
@@ -331,16 +427,27 @@ def agent_home_files(
     files = {f"{home}/{_AGENT_PROMPT_BASENAME}": system_append}
     if driver == "codex":
         files[f"{home}/codex-home/AGENTS.md"] = system_append
-        if codex_transport == "gateway":
-            files[f"{home}/codex-home/config.toml"] = _codex_gateway_config(
-                base_url=gateway_base_url, model=model)
+        if codex_transport == "gateway" or _enabled_mcp_servers(mcp_servers):
+            files[f"{home}/codex-home/config.toml"] = _codex_config(
+                base_url=gateway_base_url if codex_transport == "gateway" else "",
+                model=model if codex_transport == "gateway" else "",
+                mcp_servers=mcp_servers,
+            )
     else:
         settings = {"permissions": {"allow": _claude_allow_rules(io_cli, home)}}
         files[f"{home}/claude-home/settings.json"] = json.dumps(settings, indent=2)
+        if _enabled_mcp_servers(mcp_servers):
+            files[f"{home}/claude-home/{_MCP_CLAUDE_CONFIG_BASENAME}"] = _claude_mcp_config(mcp_servers)
     return files
 
 
-def stale_home_files(home: str, *, driver: str, codex_transport: str = "native") -> list[str]:
+def stale_home_files(
+    home: str,
+    *,
+    driver: str,
+    codex_transport: str = "native",
+    mcp_servers: list[dict] | None = None,
+) -> list[str]:
     """Per-user home paths a (re)spawn must PRUNE — files ``agent_home_files`` does
     not write for the current driver/transport but a PERSISTENT home may still carry
     from a prior config. Absolute paths.
@@ -356,8 +463,10 @@ def stale_home_files(home: str, *, driver: str, codex_transport: str = "native")
     designed. ``gateway`` transport returns [] — it WRITES that config this spawn and
     must never prune it."""
     stale: list[str] = []
-    if codex_transport != "gateway":
+    if codex_transport != "gateway" and not _enabled_mcp_servers(mcp_servers):
         stale.append(f"{home}/codex-home/config.toml")
+    if driver != "claude" or not _enabled_mcp_servers(mcp_servers):
+        stale.append(f"{home}/claude-home/{_MCP_CLAUDE_CONFIG_BASENAME}")
     return stale
 
 
@@ -373,6 +482,7 @@ def materialize_home(
     base_url: str = "",
     provider: str = "",
     identity_model: str = "",
+    mcp_servers: list[dict] | None = None,
 ) -> None:
     """Write the per-user home files for a spawn AND prune stale ones a persistent
     home may carry (see ``stale_home_files``). Idempotent — safe before every
@@ -385,12 +495,21 @@ def materialize_home(
     files = agent_home_files(
         home, driver=driver, io_cli=io_cli, codex_transport=codex_transport,
         gateway_base_url=gateway_base_url, model=model, persona_content=persona_content,
-        base_url=base_url, provider=provider, identity_model=identity_model)
+        base_url=base_url, provider=provider, identity_model=identity_model,
+        mcp_servers=mcp_servers)
     for path, content in files.items():
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content)
-    for path in stale_home_files(home, driver=driver, codex_transport=codex_transport):
+        if p.name in {"config.toml", _MCP_CLAUDE_CONFIG_BASENAME}:
+            try:
+                os.chmod(p, 0o600)
+            except OSError:
+                pass
+    for path in stale_home_files(
+        home, driver=driver, codex_transport=codex_transport,
+        mcp_servers=mcp_servers,
+    ):
         if path not in files:
             Path(path).unlink(missing_ok=True)
 
@@ -459,8 +578,9 @@ def consumer_env(base_env: dict, entry: dict, *, user_id: str, home: str) -> dic
     env["AGENT_MODE"] = entry.get("agent_mode", "cli")
     cli_cmd = entry.get("cli_cmd")
     if not cli_cmd and driver == "claude" and _claude_cli_should_stream_thinking(entry):
-        cli_cmd = _default_thinking_claude_cmd(home)
-    env["AGENT_CLI_CMD"] = cli_cmd or _default_cli_cmd(driver, home)
+        cli_cmd = _default_thinking_claude_cmd(home, mcp_servers=entry.get("mcp_servers"))
+    env["AGENT_CLI_CMD"] = cli_cmd or _default_cli_cmd(
+        driver, home, mcp_servers=entry.get("mcp_servers"))
     # Per-user isolation: separate checkpoint, agent session, image temp dir, and
     # a per-user agent home (Claude/Codex) so nothing is shared across users.
     env["CHECKPOINT_FILE"] = f"{home}/checkpoint.json"
@@ -489,6 +609,7 @@ def consumer_env(base_env: dict, entry: dict, *, user_id: str, home: str) -> dic
                 env["CODEX_API_KEY"] = gw_key
         elif entry.get("provider_key"):
             env["CODEX_API_KEY"] = entry["provider_key"]
+        env.update(_codex_mcp_env(entry.get("mcp_servers")))
     else:
         env["CLAUDE_CONFIG_DIR"] = f"{home}/claude-home"
         if entry.get("provider_key"):
@@ -581,6 +702,7 @@ class ProcessSpawner:
             persona_content=_genesis_persona_content(
                 user_id, entry.get("api_key"),
                 runtime_token=entry.get("runtime_token", "")),
+            mcp_servers=entry.get("mcp_servers"),
         )
         env = consumer_env(os.environ, entry, user_id=user_id, home=home)
         return self.register(subprocess.Popen([sys.executable, _RESIDENT_CONSUMER], env=env))
@@ -638,6 +760,8 @@ def build_container_argv(entry: dict, *, user_id: str, home: str, image: str) ->
     for key in _CONSUMER_ENV_KEYS:
         if key in env:
             argv += ["-e", key]
+    for key in sorted(k for k in env if k.startswith("FEEDLING_MCP_")):
+        argv += ["-e", key]
     argv += [image, "python", "-u", "tools/chat_resident_consumer.py"]
     return argv
 

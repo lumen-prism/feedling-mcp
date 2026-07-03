@@ -720,6 +720,37 @@ def test_resolve_discovered_builds_entries_via_token_without_api_key(monkeypatch
     assert minted["u1"] == "tok-u1"
 
 
+def test_resolve_discovered_attaches_mcp_servers_and_sha(monkeypatch):
+    enabled = {"u1": {"driver": "claude", "provider": "anthropic", "model": "claude-x", "base_url": ""}}
+
+    monkeypatch.setattr(supervisor_mod, "_fetch_key_envelope",
+                        lambda api_url, api_key="", runtime_token="": {"ct": "provider"})
+    monkeypatch.setattr(supervisor_mod, "_decrypt_provider_key",
+                        lambda enclave_url, api_key="", envelope=None, runtime_token="": "sk-ant")
+    monkeypatch.setattr(supervisor_mod.db, "mcp_server_load",
+                        lambda uid: [{"id": "mcp1", "body_ct": "ct"}])
+    monkeypatch.setattr(supervisor_mod, "_render_mcp_servers",
+                        lambda enclave_url, envelopes, runtime_token="": [{
+                            "id": "mcp1",
+                            "slug": "github",
+                            "url": "https://api.githubcopilot.com/mcp/",
+                            "transport": "http",
+                            "enabled": True,
+                        }])
+
+    out = supervisor_mod._resolve_discovered(enabled, mint_token=lambda uid: f"tok-{uid}",
+                                             api_url="http://b:5001", enclave_url="https://e:5003", cache={})
+    e = out[0]
+    assert e["mcp_servers"][0]["slug"] == "github"
+    assert len(e["mcp_config_sha256"]) == 64
+
+
+def test_spawn_identity_changes_when_mcp_config_sha_changes():
+    a = {"driver": "claude", "provider": "anthropic", "model": "m", "mcp_config_sha256": "a"}
+    b = dict(a, mcp_config_sha256="b")
+    assert supervisor_mod._spawn_identity(a) != supervisor_mod._spawn_identity(b)
+
+
 def test_resolve_discovered_caches_by_user_and_envelope(monkeypatch):
     # Re-resolving the same user with the same envelope must NOT re-hit the enclave
     # every tick (decrypt is a network call).
