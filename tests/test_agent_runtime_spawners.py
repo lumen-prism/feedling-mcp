@@ -459,6 +459,75 @@ def test_agent_home_files_codex_native_omits_gateway_config():
     assert "/h/codex-home/config.toml" not in files
 
 
+def test_agent_home_files_codex_mcp_writes_config_without_leaking_bearer():
+    files = spawners.agent_home_files(
+        "/h",
+        driver="codex",
+        provider="openai",
+        codex_transport="native",
+        mcp_servers=[{
+            "id": "srv1",
+            "slug": "github",
+            "url": "https://api.githubcopilot.com/mcp/",
+            "transport": "http",
+            "enabled": True,
+            "headers": {"Authorization": "Bearer ghp_secret"},
+        }],
+    )
+
+    cfg = files["/h/codex-home/config.toml"]
+    assert '[mcp_servers.github]' in cfg
+    assert 'url = "https://api.githubcopilot.com/mcp/"' in cfg
+    assert 'bearer_token_env_var = "FEEDLING_MCP_GITHUB_BEARER_TOKEN"' in cfg
+    assert "ghp_secret" not in cfg
+
+
+def test_agent_home_files_codex_gateway_and_mcp_merge_same_config():
+    files = spawners.agent_home_files(
+        "/h",
+        driver="codex",
+        provider="gemini",
+        codex_transport="gateway",
+        gateway_base_url="http://127.0.0.1:4000/v1",
+        model="gw-u1",
+        mcp_servers=[{
+            "id": "srv1",
+            "slug": "github",
+            "url": "https://api.githubcopilot.com/mcp/",
+            "transport": "http",
+            "enabled": True,
+        }],
+    )
+
+    cfg = files["/h/codex-home/config.toml"]
+    assert 'model_provider = "feedling_gateway"' in cfg
+    assert '[model_providers.feedling_gateway]' in cfg
+    assert '[mcp_servers.github]' in cfg
+    assert 'url = "https://api.githubcopilot.com/mcp/"' in cfg
+
+
+def test_consumer_env_exposes_codex_mcp_bearer_env_without_logging_header_name():
+    env = spawners.consumer_env(
+        {},
+        {
+            "api_key": "fk",
+            "provider_key": "sk-oai",
+            "driver": "codex",
+            "mcp_servers": [{
+                "slug": "github",
+                "url": "https://api.githubcopilot.com/mcp/",
+                "transport": "http",
+                "enabled": True,
+                "headers": {"Authorization": "Bearer ghp_secret"},
+            }],
+        },
+        user_id="u_1",
+        home="/h",
+    )
+
+    assert env["FEEDLING_MCP_GITHUB_BEARER_TOKEN"] == "ghp_secret"
+
+
 def test_stale_home_files_native_codex_prunes_gateway_config():
     # A user who switched from a gateway provider (gemini/openrouter/...) to native
     # openai leaves a codex-home/config.toml pointing at the in-CVM gateway on the
@@ -466,6 +535,16 @@ def test_stale_home_files_native_codex_prunes_gateway_config():
     # would survive and keep routing codex at the (now-dead) :4000 — list it to prune.
     stale = spawners.stale_home_files("/h", driver="codex", codex_transport="native")
     assert "/h/codex-home/config.toml" in stale
+
+
+def test_stale_home_files_codex_mcp_keeps_config_even_on_native():
+    stale = spawners.stale_home_files(
+        "/h",
+        driver="codex",
+        codex_transport="native",
+        mcp_servers=[{"slug": "github", "url": "https://api.githubcopilot.com/mcp/", "enabled": True}],
+    )
+    assert "/h/codex-home/config.toml" not in stale
 
 
 def test_stale_home_files_gateway_codex_keeps_config():
@@ -497,6 +576,43 @@ def test_materialize_home_writes_and_keeps_gateway_config(tmp_path):
     cfg = tmp_path / "u" / "codex-home" / "config.toml"
     assert cfg.exists()
     assert "http://127.0.0.1:4000/v1" in cfg.read_text()
+
+
+def test_materialize_home_writes_mcp_config_files_0600(tmp_path):
+    home = str(tmp_path / "u")
+    spawners.materialize_home(
+        home,
+        driver="claude",
+        provider="anthropic",
+        mcp_servers=[{
+            "slug": "github",
+            "url": "https://api.githubcopilot.com/mcp/",
+            "transport": "http",
+            "enabled": True,
+            "headers": {"Authorization": "Bearer ghp_secret"},
+        }],
+    )
+    mcp_cfg = tmp_path / "u" / "claude-home" / "mcp.json"
+    assert mcp_cfg.exists()
+    assert oct(mcp_cfg.stat().st_mode & 0o777) == "0o600"
+    assert "ghp_secret" in mcp_cfg.read_text()
+
+
+def test_default_claude_cmd_allows_mcp_server_prefix():
+    env = spawners.consumer_env(
+        {},
+        {
+            "api_key": "fk",
+            "provider_key": "sk-ant",
+            "driver": "claude",
+            "mcp_servers": [{"slug": "github", "url": "https://api.githubcopilot.com/mcp/", "enabled": True}],
+        },
+        user_id="u_1",
+        home="/h",
+    )
+    cmd = env["AGENT_CLI_CMD"]
+    assert "--mcp-config /h/claude-home/mcp.json" in cmd
+    assert "mcp__github" in cmd
 
 
 # ---- Stage D slice 3a: runtime-token file delivery ----

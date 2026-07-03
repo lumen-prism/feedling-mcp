@@ -36,6 +36,7 @@ from __future__ import annotations
 import base64
 import concurrent.futures
 from datetime import datetime
+import hashlib
 import json
 import logging
 import os
@@ -58,6 +59,7 @@ if str(_BACKEND_DIR) not in sys.path:
 import db
 from core import runtime_token
 from agent_runtime import leases, litellm_gateway, spawners
+import mcp_readside_core
 
 log = logging.getLogger("feedling.agent_runtime.supervisor")
 
@@ -648,10 +650,70 @@ def _resolve_one(uid: str, info: dict, *, mint_token, api_url: str, enclave_url:
         # from _spawn_identity, so per-tick rotation does not bounce the consumer.
         if tok:
             entry["runtime_token"] = tok
+        mcp_servers, mcp_sha = _resolve_mcp_config(
+            uid,
+            enclave_url=enclave_url,
+            runtime_token=tok,
+            cache=cache,
+        )
+        if mcp_servers:
+            entry["mcp_servers"] = mcp_servers
+        if mcp_sha:
+            entry["mcp_config_sha256"] = mcp_sha
         return entry
     except Exception as e:  # noqa: BLE001
         log.warning("resolve_discovered failed for %s; skipping this tick: %s", uid, e)
         return None
+
+
+def _mcp_config_sha(servers: list[dict]) -> str:
+    if not servers:
+        return ""
+    raw = json.dumps(servers, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _render_mcp_servers(enclave_url: str, envelopes: list[dict], *, runtime_token: str) -> list[dict]:
+    response = mcp_readside_core.post_enclave_mcp_render(
+        enclave_url,
+        envelopes,
+        runtime_token=runtime_token,
+    )
+    servers = response.get("servers")
+    return servers if isinstance(servers, list) else []
+
+
+def _resolve_mcp_config(uid: str, *, enclave_url: str, runtime_token: str, cache: dict) -> tuple[list[dict], str]:
+    if not enclave_url or not runtime_token:
+        return [], ""
+    try:
+        envelopes = db.mcp_server_load(uid)
+    except Exception as e:  # noqa: BLE001
+        log.warning("mcp config load failed for %s; continuing without MCP: %s", uid, e)
+        cached = cache.get(uid) or {}
+        return cached.get("mcp_servers") or [], cached.get("mcp_config_sha256") or ""
+    if not envelopes:
+        slot = cache.setdefault(uid, {})
+        slot.pop("mcp_sig", None)
+        slot.pop("mcp_servers", None)
+        slot.pop("mcp_config_sha256", None)
+        return [], ""
+
+    sig = json.dumps(envelopes, sort_keys=True, separators=(",", ":"))
+    cached = cache.get(uid) or {}
+    if cached.get("mcp_sig") == sig:
+        return cached.get("mcp_servers") or [], cached.get("mcp_config_sha256") or ""
+    try:
+        servers = _render_mcp_servers(enclave_url, envelopes, runtime_token=runtime_token)
+    except Exception as e:  # noqa: BLE001
+        log.warning("mcp config render failed for %s; continuing with last-good MCP config: %s", uid, e)
+        return cached.get("mcp_servers") or [], cached.get("mcp_config_sha256") or ""
+    sha = _mcp_config_sha(servers)
+    slot = cache.setdefault(uid, {})
+    slot["mcp_sig"] = sig
+    slot["mcp_servers"] = servers
+    slot["mcp_config_sha256"] = sha
+    return servers, sha
 
 
 def _resolve_discovered(enabled: dict, *, mint_token, api_url: str, enclave_url: str,
@@ -861,6 +923,7 @@ def _spawn_identity(entry: dict) -> tuple:
         entry.get("identity_model") or "",
         "" if gateway else (entry.get("provider_key") or ""),
         entry.get("persona_version") or "",
+        entry.get("mcp_config_sha256") or "",
     )
 
 
