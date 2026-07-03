@@ -1402,6 +1402,7 @@ def v1_worldbook_match():
     return jsonify(response)
 
 
+# MCP-FEATURE: enclave-side decrypt + SSRF/slug validation of MCP config. Remove with the feature.
 @app.route("/v1/mcp/validate", methods=["POST"])
 def v1_mcp_validate():
     _api_key, authorized_user_id, content_sk, error = _memory_readside_auth_context()

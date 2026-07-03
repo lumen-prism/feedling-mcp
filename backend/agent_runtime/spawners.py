@@ -114,6 +114,9 @@ def _toml_string(value: str) -> str:
     return json.dumps(str(value))
 
 
+# MCP-FEATURE: injection gate. Everything MCP in this file keys off this — an empty
+# result means the spawn/config path behaves exactly as before MCP existed. To remove
+# the feature, drop the MCP helpers + the `_enabled_mcp_servers(...)` call sites here.
 def _enabled_mcp_servers(mcp_servers: list[dict] | None) -> list[dict]:
     out: list[dict] = []
     for server in mcp_servers or []:

@@ -110,7 +110,7 @@ class UserStore:
         self.memory_lock = threading.Lock()
         self.world_books: list[dict] = []
         self.world_books_lock = threading.Lock()
-        self.mcp_servers: list[dict] = []
+        self.mcp_servers: list[dict] = []  # MCP-FEATURE (collection + _load/upsert/delete_mcp_server below)
         self.mcp_servers_lock = threading.Lock()
         self.consumer_state_lock = threading.Lock()
 

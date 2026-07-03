@@ -673,6 +673,8 @@ def _mcp_config_sha(servers: list[dict]) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+# MCP-FEATURE: reads the user's ciphertext MCP config + renders it via the enclave;
+# feeds mcp_config_sha256 into _spawn_identity (respawn on change). Remove with the feature.
 def _render_mcp_servers(enclave_url: str, envelopes: list[dict], *, runtime_token: str) -> list[dict]:
     response = mcp_readside_core.post_enclave_mcp_render(
         enclave_url,

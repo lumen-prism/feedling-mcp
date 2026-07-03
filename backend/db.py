@@ -1611,6 +1611,7 @@ def world_book_replace_all(user_id: str, entries: list[dict]) -> None:
 # ---------------------------------------------------------------------------
 
 
+# MCP-FEATURE: mcp_server_entries table accessors (load/upsert/delete). Remove with the feature.
 def mcp_server_load(user_id: str) -> list[dict]:
     try:
         with get_pool().connection() as conn:
